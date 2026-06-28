@@ -189,7 +189,14 @@ def resolve_runtime_home() -> Path:
 
 
 def resolve_account_file(platform: str, account_name: str) -> Path:
-    account_file = resolve_runtime_home() / "cookies" / f"{platform}_{account_name}.json"
+    # 支持通过环境变量覆盖账号文件目录
+    import os
+    accounts_dir = os.environ.get("SAU_ACCOUNTS_DIR")
+    if accounts_dir:
+        base_dir = Path(accounts_dir)
+    else:
+        base_dir = resolve_runtime_home() / "cookies"
+    account_file = base_dir / f"{platform}_{account_name}.json"
     account_file.parent.mkdir(exist_ok=True)
     return account_file
 
