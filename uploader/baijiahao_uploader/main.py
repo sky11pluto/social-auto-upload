@@ -36,8 +36,13 @@ async def baijiahao_cookie_gen(account_file):
 
 
 async def cookie_auth(account_file):
+    # 允许通过环境变量控制 cookie_auth 的 headless 模式
+    use_headless = os.environ.get("BAIJIAHAO_COOKIE_AUTH_HEADLESS", "").lower() in ("1", "true", "yes")
+    if not use_headless:
+        use_headless = LOCAL_CHROME_HEADLESS
+    
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=LOCAL_CHROME_HEADLESS)
+        browser = await playwright.chromium.launch(headless=use_headless)
         context = await browser.new_context(storage_state=account_file)
         context = await set_init_script(context)
         # 创建一个新的页面
@@ -63,7 +68,7 @@ async def baijiahao_setup(account_file, handle=False):
     return True
 
 class BaiJiaHaoVideo(object):
-    def __init__(self, title, file_path, tags, publish_date: datetime, account_file, proxy_setting=None):
+    def __init__(self, title, file_path, tags, publish_date: datetime, account_file, proxy_setting=None, headless=None):
         self.title = title  # 视频标题
         self.file_path = file_path
         self.tags = tags
@@ -71,7 +76,7 @@ class BaiJiaHaoVideo(object):
         self.account_file = account_file
         self.date_format = '%Y年%m月%d日 %H:%M'
         self.local_executable_path = LOCAL_CHROME_PATH
-        self.headless = LOCAL_CHROME_HEADLESS
+        self.headless = headless if headless is not None else LOCAL_CHROME_HEADLESS
         self.proxy_setting = proxy_setting
 
     async def set_schedule_time(self, page, publish_date):
