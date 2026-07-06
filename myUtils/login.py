@@ -54,7 +54,7 @@ async def douyin_cookie_gen(id,status_queue):
                 lambda frame: asyncio.create_task(on_url_change()) if frame == page.main_frame else None)
         try:
             # 等待 URL 变化或超时
-            await asyncio.wait_for(url_changed_event.wait(), timeout=200)  # 最多等待 200 秒
+            await asyncio.wait_for(url_changed_event.wait(), timeout=300)  # 最多等待 200 秒
             print("监听页面跳转成功")
         except asyncio.TimeoutError:
             print("监听页面跳转超时")
@@ -132,7 +132,7 @@ async def get_tencent_cookie(id,status_queue):
 
         try:
             # 等待 URL 变化或超时
-            await asyncio.wait_for(url_changed_event.wait(), timeout=200)  # 最多等待 200 秒
+            await asyncio.wait_for(url_changed_event.wait(), timeout=300)  # 最多等待 200 秒
             print("监听页面跳转成功")
         except asyncio.TimeoutError:
             status_queue.put("500")
@@ -206,7 +206,7 @@ async def get_ks_cookie(id,status_queue):
 
         try:
             # 等待 URL 变化或超时
-            await asyncio.wait_for(url_changed_event.wait(), timeout=200)  # 最多等待 200 秒
+            await asyncio.wait_for(url_changed_event.wait(), timeout=300)  # 最多等待 200 秒
             print("监听页面跳转成功")
         except asyncio.TimeoutError:
             status_queue.put("500")
@@ -280,7 +280,7 @@ async def xiaohongshu_cookie_gen(id,status_queue):
 
         try:
             # 等待 URL 变化或超时
-            await asyncio.wait_for(url_changed_event.wait(), timeout=200)  # 最多等待 200 秒
+            await asyncio.wait_for(url_changed_event.wait(), timeout=300)  # 最多等待 200 秒
             print("监听页面跳转成功")
         except asyncio.TimeoutError:
             status_queue.put("500")

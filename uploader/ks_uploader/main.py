@@ -75,7 +75,7 @@ def _build_login_result(
 
 async def _is_ks_cookie_invalid(page: Page, timeout: int = 5000) -> bool:
     try:
-        await page.wait_for_selector(KUAISHOU_COOKIE_INVALID_SELECTOR, timeout=timeout)
+        await page.wait_for_selector(KUAISHOU_COOKIE_INVALID_SELECTOR, timeout=30000)
         return True
     except Exception:
         return False
@@ -89,12 +89,12 @@ async def _extract_ks_qrcode_src(page: Page) -> str:
     try:
         if not await qrcode_img.count() or not await qrcode_img.is_visible():
             platform_switch = login_form.locator("div.platform-switch").first
-            await platform_switch.wait_for(state="visible", timeout=10000)
+            await platform_switch.wait_for(state="visible", timeout=30000)
             await platform_switch.click()
             await asyncio.sleep(1)
     except Exception:
         platform_switch = login_form.locator("div.platform-switch").first
-        await platform_switch.wait_for(state="visible", timeout=10000)
+        await platform_switch.wait_for(state="visible", timeout=30000)
         await platform_switch.click()
         await asyncio.sleep(1)
 

@@ -22,12 +22,12 @@ async def cookie_auth_douyin(account_file):
         # 访问指定的 URL
         await page.goto("https://creator.douyin.com/creator-micro/content/upload")
         try:
-            await page.wait_for_url("https://creator.douyin.com/creator-micro/content/upload", timeout=5000)
+            await page.wait_for_url("https://creator.douyin.com/creator-micro/content/upload", timeout=30000)
             # 2024.06.17 抖音创作者中心改版
             # 判断
             # 等待“扫码登录”元素出现，超时 5 秒（如果 5 秒没出现，说明 cookie 有效）
             try:
-                await page.get_by_text("扫码登录").wait_for(timeout=5000)
+                await page.get_by_text("扫码登录").wait_for(timeout=30000)
                 douyin_logger.error("[+] cookie 失效，需要扫码登录")
                 return False
             except:
@@ -50,7 +50,7 @@ async def cookie_auth_tencent(account_file):
         # 访问指定的 URL
         await page.goto("https://channels.weixin.qq.com/platform/post/create")
         try:
-            await page.wait_for_selector('div.title-name:has-text("微信小店")', timeout=5000)  # 等待5秒
+            await page.wait_for_selector('div.title-name:has-text("微信小店")', timeout=30000)  # 等待5秒
             tencent_logger.error("[+] 等待5秒 cookie 失效")
             return False
         except:
@@ -68,7 +68,7 @@ async def cookie_auth_ks(account_file):
         # 访问指定的 URL
         await page.goto("https://cp.kuaishou.com/article/publish/video")
         try:
-            await page.wait_for_selector("div.names div.container div.name:text('机构服务')", timeout=5000)  # 等待5秒
+            await page.wait_for_selector("div.names div.container div.name:text('机构服务')", timeout=30000)  # 等待5秒
 
             kuaishou_logger.info("[+] 等待5秒 cookie 失效")
             return False
@@ -87,7 +87,7 @@ async def cookie_auth_xhs(account_file):
         # 访问指定的 URL
         await page.goto("https://creator.xiaohongshu.com/creator-micro/content/upload")
         try:
-            await page.wait_for_url("https://creator.xiaohongshu.com/creator-micro/content/upload", timeout=5000)
+            await page.wait_for_url("https://creator.xiaohongshu.com/creator-micro/content/upload", timeout=30000)
         except:
             print("[+] 等待5秒 cookie 失效")
             await context.close()

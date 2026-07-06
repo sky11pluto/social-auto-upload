@@ -112,7 +112,7 @@ async def cookie_auth(account_file):
             context = await set_init_script(context)
             page = await context.new_page()
             await page.goto(TENCENT_UPLOAD_URL)
-            await page.wait_for_url(TENCENT_UPLOAD_URL, timeout=5000)
+            await page.wait_for_url(TENCENT_UPLOAD_URL, timeout=30000)
 
             login_markers = [
                 page.get_by_text("扫码登录", exact=True).first,
@@ -501,8 +501,8 @@ class TencentBaseUploader(BaseVideoUploader):
             await page.keyboard.press("Escape")
 
     async def open_upload_page(self, page: Page) -> None:
-        await page.goto(TENCENT_UPLOAD_URL, timeout=120000, wait_until="domcontentloaded")
-        await page.wait_for_url(TENCENT_UPLOAD_URL, timeout=120000)
+        await page.goto(TENCENT_UPLOAD_URL, timeout=180000, wait_until="domcontentloaded")
+        await page.wait_for_url(TENCENT_UPLOAD_URL, timeout=180000)
 
     async def upload_video_file(self, page: Page, file_path: str) -> None:
         async def find_file_input():

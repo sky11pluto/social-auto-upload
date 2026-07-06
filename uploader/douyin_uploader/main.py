@@ -61,7 +61,7 @@ async def cookie_auth(account_file):
                 context = await browser.new_context(storage_state=account_file)
                 context = await set_init_script(context)
                 page = await context.new_page()
-                await page.goto("https://creator.douyin.com/creator-micro/content/upload", wait_until="domcontentloaded", timeout=90000)
+                await page.goto("https://creator.douyin.com/creator-micro/content/upload", wait_until="domcontentloaded", timeout=180000)
                 await page.wait_for_timeout(2500)  # 等页面稳定，避免瞬时跳转误判
                 has_login = await page.get_by_text("手机号登录").count() or await page.get_by_text("扫码登录").count()
                 if "content/upload" in page.url and not has_login:
@@ -90,12 +90,12 @@ async def _extract_douyin_qrcode_src(page: Page) -> str:
     # 等 SPA 加载完成（不只等"扫码登录"文字，否则抖音慢加载时 30s 就超时）。
     # 给 domcontentloaded 后足够时间让客户端 JS 注入登录卡。
     try:
-        await page.wait_for_load_state("networkidle", timeout=15000)
+        await page.wait_for_load_state("networkidle", timeout=30000)
     except Exception:
         pass
     scan_login_tab = page.get_by_text("扫码登录", exact=True).first
     # attached 状态：DOM 里出现即可，不要求 visible/渲染完整，避免 race
-    await scan_login_tab.wait_for(state="attached", timeout=60000)
+    await scan_login_tab.wait_for(state="attached", timeout=120000)
 
     # 新版抖音创作者中心 (single_tab + animate_qrcode_container) 不再用 aria-label="二维码"。
     # 按优先级兜底多个 selector，至少一个能命中即可。
@@ -627,7 +627,7 @@ class DouYinVideo(DouYinBaseUploader):
         context = await set_init_script(context)
 
         page = await context.new_page()
-        await page.goto("https://creator.douyin.com/creator-micro/content/upload", wait_until="domcontentloaded", timeout=90000)
+        await page.goto("https://creator.douyin.com/creator-micro/content/upload", wait_until="domcontentloaded", timeout=180000)
         douyin_logger.info(_msg("🏃", f"小人开始搬运视频: {self.title}.mp4"))
         douyin_logger.info(_msg("🧭", "小人正在赶往上传主页"))
         await page.wait_for_url("https://creator.douyin.com/creator-micro/content/upload", timeout=90000)
@@ -847,7 +847,7 @@ class DouYinNote(DouYinBaseUploader):
         upload_success = False
         try:
             page = await context.new_page()
-            await page.goto("https://creator.douyin.com/creator-micro/content/upload", wait_until="domcontentloaded", timeout=90000)
+            await page.goto("https://creator.douyin.com/creator-micro/content/upload", wait_until="domcontentloaded", timeout=180000)
             douyin_logger.info(_msg("🧭", "小人正在赶往图文发布页"))
             await page.wait_for_url("https://creator.douyin.com/creator-micro/content/upload", timeout=90000)
 

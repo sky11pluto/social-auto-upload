@@ -73,7 +73,7 @@ def _build_login_result(
 
 async def _open_xhs_qrcode_panel(page: Page) -> None:
     login_box = page.locator(XHS_LOGIN_BOX_SELECTOR).first
-    await login_box.wait_for(state="visible", timeout=30000)
+    await login_box.wait_for(state="visible", timeout=150000)
 
     scan_text = login_box.locator("div:has-text('扫一扫')").first
     if await scan_text.count():
@@ -98,7 +98,7 @@ async def _find_xhs_qrcode_locator(page: Page):
 
 async def _extract_xhs_qrcode_src(page: Page) -> str:
     qrcode_img = await _find_xhs_qrcode_locator(page)
-    await qrcode_img.wait_for(state="visible", timeout=30000)
+    await qrcode_img.wait_for(state="visible", timeout=150000)
     qrcode_src = await qrcode_img.get_attribute("src")
     if not qrcode_src:
         raise RuntimeError("未获取到小红书登录二维码地址")
@@ -341,7 +341,7 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
         dropdown_selector = 'div.d-popover.d-popover-default.d-dropdown.--size-min-width-large'
         await page.wait_for_timeout(2000)
         try:
-            await page.wait_for_selector(dropdown_selector, timeout=3000)
+            await page.wait_for_selector(dropdown_selector, timeout=15000)
         except Exception:
             xiaohongshu_logger.warning(_msg("😵", "位置下拉列表没按预期出现，小人继续按旧逻辑查找"))
         await page.wait_for_timeout(1000)
@@ -355,7 +355,7 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
         try:
             location_option = await page.wait_for_selector(
                 flexible_xpath,
-                timeout=3000
+                timeout=15000
             )
 
             if not location_option:
@@ -518,12 +518,12 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         cover_upload_dialog = cover_plugin_title.locator(
             "xpath=ancestor::div[contains(@class, 'cover-plugin-preview')]"
         ).locator("div.cover > div.default:visible")
-        await cover_upload_dialog.wait_for(state="visible", timeout=30000)
+        await cover_upload_dialog.wait_for(state="visible", timeout=150000)
 
         await cover_upload_dialog.click(force=True)
 
         modal = page.locator("div.d-modal.cover-modal")
-        await modal.wait_for(state="visible", timeout=30000)
+        await modal.wait_for(state="visible", timeout=150000)
 
         file_input = modal.locator('input[type="file"][accept*="image"]').first
         await file_input.wait_for(state="attached", timeout=10000)
@@ -534,7 +534,7 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         await confirm_button.wait_for(state="visible", timeout=10000)
         await confirm_button.click()
 
-        await modal.wait_for(state="hidden", timeout=30000)
+        await modal.wait_for(state="hidden", timeout=150000)
         xiaohongshu_logger.success(_msg("🥳", "封面已经设置完成"))
 
     async def upload_video_content(self, page: Page) -> None:
@@ -549,7 +549,7 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
 
         while True:
             try:
-                upload_input = await page.wait_for_selector('input.upload-input', timeout=3000)
+                upload_input = await page.wait_for_selector('input.upload-input', timeout=15000)
                 preview_new = await upload_input.query_selector(
                     'xpath=following-sibling::div[contains(@class, "preview-new")]')
                 if preview_new:
@@ -605,7 +605,7 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
                     await page.locator('button:has-text("发布")').click()
                 await page.wait_for_url(
                     XHS_PUBLISH_SUCCESS_URL_PATTERN,
-                    timeout=3000
+                    timeout=15000
                 )
                 xiaohongshu_logger.success(_msg("🥳", "视频发布成功，小人开心收工"))
                 break
@@ -698,14 +698,14 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
         if not await upload_input.count():
             upload_input = page.locator("div[class^='upload-content'] input[class='upload-input']").first
 
-        await upload_input.wait_for(state="attached", timeout=30000)
+        await upload_input.wait_for(state="attached", timeout=150000)
         xiaohongshu_logger.info(_msg("📤", "小人正在上传图片"))
         await upload_input.set_input_files(self.image_paths)
 
         while True:
             try:
                 title_container = page.locator('input[placeholder*="填写标题"]').first
-                await title_container.wait_for(state="visible", timeout=3000)
+                await title_container.wait_for(state="visible", timeout=15000)
                 xiaohongshu_logger.success(_msg("🥳", "图文素材已经传完，可以开始填写内容了"))
                 break
             except Exception:
@@ -728,7 +728,7 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
                     await page.locator('button:has-text("发布")').click()
                 await page.wait_for_url(
                     XHS_PUBLISH_SUCCESS_URL_PATTERN,
-                    timeout=3000
+                    timeout=15000
                 )
                 xiaohongshu_logger.success(_msg("🥳", "图文发布成功，小人开心收工"))
                 break

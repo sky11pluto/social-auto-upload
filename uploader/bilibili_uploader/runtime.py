@@ -81,7 +81,7 @@ def fetch_latest_release() -> dict:
             "Accept": "application/vnd.github+json",
             "User-Agent": "social-auto-upload",
         },
-        timeout=30,
+        timeout=120,
     )
     response.raise_for_status()
     payload = response.json()
@@ -125,7 +125,7 @@ def download_biliup_asset(release: dict, destination: Path) -> Path:
     with tempfile.TemporaryDirectory(prefix="biliup-download-") as temp_dir:
         temp_root = Path(temp_dir)
         archive_path = temp_root / release["asset_name"]
-        with requests.get(release["asset_url"], stream=True, timeout=120) as response:
+        with requests.get(release["asset_url"], stream=True, timeout=300) as response:
             response.raise_for_status()
             with archive_path.open("wb") as file_obj:
                 for chunk in response.iter_content(chunk_size=1024 * 1024):

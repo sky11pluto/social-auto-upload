@@ -21,7 +21,7 @@ if __name__ == '__main__':
     file_num = len(files)
 
     cookies = config['account1']['cookies']
-    xhs_client = XhsClient(cookies, sign=sign_local, timeout=60)
+    xhs_client = XhsClient(cookies, sign=sign_local, timeout=300)
     # auth cookie
     # 注意：该校验cookie方式可能并没那么准确
     try:

@@ -134,11 +134,11 @@ class BaiJiaHaoVideo(object):
         # 创建一个新的页面
         page = await context.new_page()
         # 访问指定的 URL
-        await page.goto("https://baijiahao.baidu.com/builder/rc/edit?type=videoV2", timeout=60000)
+        await page.goto("https://baijiahao.baidu.com/builder/rc/edit?type=videoV2", timeout=120000)
         baijiahao_logger.info(f"正在上传-------{self.title}.mp4")
         # 等待页面跳转到指定的 URL，没进入，则自动等待到超时
         baijiahao_logger.info('正在打开主页...')
-        await page.wait_for_url("https://baijiahao.baidu.com/builder/rc/edit?type=videoV2", timeout=60000)
+        await page.wait_for_url("https://baijiahao.baidu.com/builder/rc/edit?type=videoV2", timeout=120000)
 
         # 点击 "上传视频" 按钮
         await page.locator("div[class^='video-main-container'] input").set_input_files(self.file_path)
@@ -190,7 +190,7 @@ class BaiJiaHaoVideo(object):
         await browser.close()
 
 
-    @async_retry(timeout=300)  # 例如，最多重试3次，超时时间为180秒
+    @async_retry(timeout=600)  # 例如，最多重试3次，超时时间为180秒
     async def uploading_video(self, page):
         while True:
             upload_failed = await page.locator('div .cover-overlay:has-text("上传失败")').count()
@@ -225,7 +225,7 @@ class BaiJiaHaoVideo(object):
                 baijiahao_logger.error(f"定时发布失败: {e}")
                 raise  # 重新抛出异常，让重试装饰器捕获
 
-    @async_retry(timeout=300)  # 例如，最多重试3次，超时时间为180秒
+    @async_retry(timeout=600)  # 例如，最多重试3次，超时时间为180秒
     async def publish_video(self, page: Page, publish_date):
         if publish_date != 0:
             # 定时发布
@@ -271,10 +271,10 @@ class BaiJiaHaoVideo(object):
         # 创建一个新的页面
         page = await context.new_page()
         # 访问指定的 URL
-        await page.goto("https://aigc.baidu.com/make", timeout=60000)
+        await page.goto("https://aigc.baidu.com/make", timeout=120000)
         # 等待页面跳转到指定的 URL，没进入，则自动等待到超时
         baijiahao_logger.info('正在打开主页...')
-        await page.wait_for_url("https://aigc.baidu.com/make", timeout=60000)
+        await page.wait_for_url("https://aigc.baidu.com/make", timeout=120000)
 
         # 点击"全网"标签
         await page.locator('div.rounded-lg.border:has-text("全网")').click()

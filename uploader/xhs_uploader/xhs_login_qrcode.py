@@ -9,7 +9,7 @@ from uploader.xhs_uploader.main import sign
 
 # pip install qrcode
 if __name__ == '__main__':
-    xhs_client = XhsClient(sign=sign, timeout=60)
+    xhs_client = XhsClient(sign=sign, timeout=300)
     print(datetime.datetime.now())
     qr_res = xhs_client.get_qrcode()
     qr_id = qr_res["qr_id"]
