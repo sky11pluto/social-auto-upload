@@ -625,17 +625,57 @@ class DouYinBaseUploader(BaseVideoUploader):
             douyin_logger.error(_msg("😢", f"设置商品链接时出错: {str(e)}"))
             return False
 
-    async def set_self_declaration(self, page: Page, declaration: str = "内容为个人观点或见解") -> None:
-        """抖音「自主声明」为发布必选项：打开声明弹窗 → 选指定类型 → 确定。
+    async def _dismiss_cover_modals(self, page: Page) -> None:
+        """强拆封面/内容弹层，避免挡住自主声明与发布按钮。"""
+        try:
+            # 优先点确定/完成（确认应用封面）
+            for name in ("确定", "完成"):
+                btn = page.locator("div.dy-creator-content-modal").get_by_role(
+                    "button", name=name, exact=True
+                ).first
+                if await btn.count() and await btn.is_visible():
+                    await btn.click(force=True, timeout=3000)
+                    await page.wait_for_timeout(500)
+        except Exception:
+            pass
+        try:
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(300)
+        except Exception:
+            pass
+        try:
+            await page.evaluate(
+                """() => {
+                  document.querySelectorAll(
+                    '.dy-creator-content-modal-wrap, .dy-creator-content-modal, .dy-creator-content-portal'
+                  ).forEach(e => e.remove());
+                }"""
+            )
+        except Exception:
+            pass
+
+    async def set_self_declaration(self, page: Page, declaration: str = "内容由AI生成") -> None:
+        """抖音「自主声明」：按页面单选项中文文案匹配（非 id），打开声明弹窗 → 选指定类型 → 确定。
 
         入口和弹窗都是异步渲染，等不到就记 warning 跳过、继续发布，绝不因此中断
         （与小红书话题、视频号声明原创的容错策略保持一致）。
         """
+        # 文案别名：抖音偶发空格/「为」写法差异
+        declaration_aliases = [
+            declaration,
+            "内容由AI生成",
+            "内容由 AI 生成",
+            "内容为AI生成",
+            "内容为 AI 生成",
+        ]
         try:
+            # 封面弹层未关时会拦截点击（pointer-events），先清掉
+            await self._dismiss_cover_modals(page)
+
             # 发布页底部「自主声明」行，未选时显示占位文案「请选择自主声明」
             entry = page.get_by_text("请选择自主声明").first
             await entry.wait_for(state="visible", timeout=6000)
-            await entry.click()
+            await entry.click(force=True)
 
             # 弹窗标题「对作品内容添加声明」
             dialog = page.locator(".semi-modal-content").filter(has_text="对作品内容添加声明").first
@@ -643,11 +683,22 @@ class DouYinBaseUploader(BaseVideoUploader):
 
             # 单选项：Semi 的文字是 .semi-radio-addon（常带 pointer-events:none，直接点会卡 30s 超时），
             # 要点可交互的 .semi-radio 外层；找不到外层再退回 force 强制点文字。exact 避免误命中预览「作者声明：…」。
-            option = dialog.locator(".semi-radio").filter(has_text=declaration).first
-            if await option.count():
-                await option.click(timeout=6000)
-            else:
-                await dialog.get_by_text(declaration, exact=True).first.click(timeout=6000, force=True)
+            clicked = False
+            for text in declaration_aliases:
+                option = dialog.locator(".semi-radio").filter(has_text=text).first
+                if await option.count():
+                    await option.click(timeout=6000, force=True)
+                    declaration = text
+                    clicked = True
+                    break
+                label = dialog.get_by_text(text, exact=True).first
+                if await label.count():
+                    await label.click(timeout=6000, force=True)
+                    declaration = text
+                    clicked = True
+                    break
+            if not clicked:
+                raise RuntimeError(f"未找到自主声明选项：{declaration_aliases[0]}")
             await dialog.get_by_role("button", name="确定").click(timeout=6000)
             await dialog.wait_for(state="hidden", timeout=6000)
             douyin_logger.info(_msg("🧾", f"自主声明已选择「{declaration}」"))
@@ -790,51 +841,251 @@ class DouYinVideo(DouYinBaseUploader):
                     douyin_logger.warning(_msg("😵", f"推荐封面没选成功: {e}"))
         return False
 
+    async def _cover_preview_state(self, cover_locator) -> dict:
+        """读取封面弹窗预览状态，用于判断自定义图是否真正进入裁剪区。"""
+        try:
+            return await cover_locator.evaluate(
+                """(el) => {
+                  const imgs = [...el.querySelectorAll('img')]
+                    .map((i) => i.src || '')
+                    .filter((s) => s && !s.includes('data:image/svg'));
+                  const canvases = el.querySelectorAll('canvas').length;
+                  const text = el.innerText || '';
+                  return {
+                    imgs,
+                    canvases,
+                    reupload: text.includes('重新上传'),
+                    crop: text.includes('自由裁剪') || text.includes('智能裁剪') || text.includes('拖拽'),
+                  };
+                }"""
+            )
+        except Exception:
+            return {"imgs": [], "canvases": 0, "reupload": False, "crop": False}
+
+    def _cover_preview_ready(self, state: dict, before: dict | None = None) -> bool:
+        if not state:
+            return False
+        if state.get("reupload") or state.get("crop") or int(state.get("canvases") or 0) > 0:
+            return True
+        imgs = state.get("imgs") or []
+        if any(s.startswith("blob:") or s.startswith("http") for s in imgs):
+            if before is None:
+                return True
+            return imgs != (before.get("imgs") or [])
+        return False
+
+    async def _upload_cover_via_file_chooser(self, page: Page, cover_locator, thumb_path: str) -> bool:
+        """优先用 file chooser：点击可见上传区，避免塞错 AI 参考图 hidden input。"""
+        click_targets = [
+            cover_locator.get_by_text("点击上传", exact=True).first,
+            cover_locator.get_by_text("上传图片", exact=True).first,
+            cover_locator.locator(".semi-upload-drag").last,
+            cover_locator.locator(".semi-upload").last,
+            cover_locator.get_by_text("上传封面", exact=True).first,
+        ]
+        for idx, target in enumerate(click_targets):
+            try:
+                if not await target.count() or not await target.is_visible():
+                    continue
+                async with page.expect_file_chooser(timeout=6000) as fc_info:
+                    await target.click(force=True)
+                chooser = await fc_info.value
+                await chooser.set_files(thumb_path)
+                douyin_logger.info(_msg("🔍", f"封面 fileChooser 上传成功（target#{idx}）"))
+                return True
+            except Exception as exc:
+                douyin_logger.debug(_msg("🔍", f"fileChooser target#{idx} 失败: {exc}"))
+        return False
+
+    async def _upload_cover_via_inputs(self, cover_locator, thumb_path: str) -> bool:
+        """回退：按 input 索引逐个试，封面位优先，直到预览就绪。"""
+        inputs = cover_locator.locator("input.semi-upload-hidden-input, input[type='file']")
+        n = await inputs.count()
+        douyin_logger.info(_msg("🔍", f"封面弹窗 file input 数量={n}"))
+        if n <= 0:
+            return False
+        order = [i for i in (2, 3, 1, 0) if i < n]
+        for i in range(n):
+            if i not in order:
+                order.append(i)
+        for i in order:
+            before = await self._cover_preview_state(cover_locator)
+            try:
+                await inputs.nth(i).set_input_files(thumb_path)
+            except Exception as exc:
+                douyin_logger.debug(_msg("🔍", f"input#{i} set_input_files 失败: {exc}"))
+                continue
+            ok = False
+            for _ in range(20):
+                state = await self._cover_preview_state(cover_locator)
+                if self._cover_preview_ready(state, before):
+                    ok = True
+                    break
+                await asyncio.sleep(0.4)
+            if ok:
+                douyin_logger.info(_msg("🔍", f"封面 input#{i} 上传后预览已就绪"))
+                return True
+            douyin_logger.warning(_msg("⚠️", f"封面 input#{i} 未出现预览，尝试下一个"))
+        return False
+
+    async def _verify_cover_on_publish_page(self, page: Page) -> bool:
+        """发布页「选择封面」附近是否已有缩略图。"""
+        try:
+            tip = page.get_by_text("请设置封面后再发布").first
+            if await tip.count():
+                try:
+                    if await tip.is_visible():
+                        return False
+                except Exception:
+                    pass
+            entry = page.get_by_text("选择封面", exact=True).first
+            if not await entry.count():
+                return False
+            box = entry.locator("xpath=ancestor::div[4]")
+            imgs = box.locator("img")
+            if await imgs.count() == 0:
+                box = page.locator("div").filter(has_text="选择封面").first
+                imgs = box.locator("img")
+            for i in range(min(await imgs.count(), 6)):
+                src = await imgs.nth(i).get_attribute("src") or ""
+                if src.startswith("http") or src.startswith("blob:") or src.startswith("//"):
+                    return True
+        except Exception:
+            return False
+        return False
+
     async def set_thumbnail(self, page: Page):
         if not self.thumbnail_landscape_path and not self.thumbnail_portrait_path:
             return
 
         douyin_logger.info(_msg("🏃", "小人正在设置视频封面"))
-        # 先清掉 shepherd 新手引导浮层，否则它会拦截“选择封面”点击导致弹窗打不开
         await page.evaluate(
             "() => document.querySelectorAll('.shepherd-element,.shepherd-modal-overlay-container').forEach(e=>e.remove())"
         )
         await page.get_by_text("选择封面", exact=True).first.click(force=True)
-        cover_locator_str = 'div.dy-creator-content-modal'
+        cover_locator_str = "div.dy-creator-content-modal"
         cover_locator = page.locator(cover_locator_str).first
         await page.wait_for_selector(cover_locator_str, timeout=20000)
+        await page.wait_for_timeout(1200)
 
-        await page.wait_for_timeout(1500)
-        # version_2 封面弹窗有 4 个隐藏 file input：
-        #   [0]/[1] 左侧“AI生成参考图”上传/替换，[2]/[3] 才是“上传封面”/替换。
-        # 旧代码用 .first 传到了 AI 参考图（不会成为封面）→ 这就是“传了却没封面”的根因。
-        # 取 input.semi-upload-hidden-input 的第 2 个（nth(1)），即真正的封面上传输入。
-        cover_upload = cover_locator.locator("input.semi-upload-hidden-input").nth(1)
-
+        thumb_path = self.thumbnail_portrait_path or self.thumbnail_landscape_path
         if self.thumbnail_portrait_path:
-            # 弹窗默认就在“设置竖封面”页；防御性点一下 tab（已激活则忽略）
             try:
                 await cover_locator.get_by_text("设置竖封面", exact=True).first.click(timeout=3000)
-                await page.wait_for_timeout(800)
+                await page.wait_for_timeout(600)
             except Exception:
                 pass
-            await cover_upload.set_input_files(self.thumbnail_portrait_path)
-            await page.wait_for_timeout(3000)
-            douyin_logger.info(_msg("🖼️", "竖版封面已上传到预览"))
-        elif self.thumbnail_landscape_path:
+            orientation = "竖版"
+        else:
             try:
                 await cover_locator.get_by_text("设置横封面", exact=True).first.click(timeout=3000)
-                await page.wait_for_timeout(800)
+                await page.wait_for_timeout(600)
             except Exception:
                 pass
-            await cover_upload.set_input_files(self.thumbnail_landscape_path)
-            await page.wait_for_timeout(3000)
-            douyin_logger.info(_msg("🖼️", "横版封面已上传到预览"))
+            orientation = "横版"
 
-        # 点红色主按钮“完成”应用封面（exact 避免误中“完成编辑”）
-        await cover_locator.get_by_role("button", name="完成", exact=True).first.click()
-        douyin_logger.info(_msg("🥳", "视频封面设置完成"))
-        await cover_locator.wait_for(state="detached", timeout=20000)
+        # 先切到「上传封面」页签，避免塞进 AI 参考/推荐帧
+        for tab_name in ("上传封面", "本地上传"):
+            try:
+                tab = cover_locator.get_by_text(tab_name, exact=True).first
+                if await tab.count() and await tab.is_visible():
+                    await tab.click(force=True)
+                    await page.wait_for_timeout(700)
+                    douyin_logger.info(_msg("🧭", f"已切换封面页签「{tab_name}」"))
+                    break
+            except Exception:
+                pass
+
+        before = await self._cover_preview_state(cover_locator)
+        uploaded = await self._upload_cover_via_file_chooser(page, cover_locator, thumb_path)
+        if uploaded:
+            preview_ok = False
+            for _ in range(30):
+                if self._cover_preview_ready(await self._cover_preview_state(cover_locator), before):
+                    preview_ok = True
+                    break
+                await asyncio.sleep(0.4)
+            uploaded = preview_ok
+        if not uploaded:
+            uploaded = await self._upload_cover_via_inputs(cover_locator, thumb_path)
+
+        if not uploaded:
+            douyin_logger.error(_msg("😵", "自定义封面未能进入预览区，放弃点完成以免空关弹窗"))
+            await self._dismiss_cover_modals(page)
+            return
+
+        douyin_logger.info(_msg("🖼️", f"{orientation}封面预览已就绪: {thumb_path}"))
+        await page.wait_for_timeout(800)
+
+        finish_btn = cover_locator.get_by_role("button", name="完成", exact=True).first
+        for _ in range(40):
+            try:
+                if await finish_btn.is_enabled():
+                    break
+            except Exception:
+                pass
+            await page.wait_for_timeout(500)
+
+        await finish_btn.click()
+        douyin_logger.info(_msg("🥳", "已点击封面完成"))
+
+        saw_confirm = False
+        for _ in range(15):
+            try:
+                confirm = page.get_by_text("是否确认应用此封面？").first
+                if await confirm.is_visible():
+                    douyin_logger.info(_msg("🪟", "弹出确认框: 是否确认应用此封面？"))
+                    modal = page.locator("div.dy-creator-content-modal").filter(
+                        has_text="是否确认应用此封面？"
+                    ).first
+                    btn = modal.get_by_role("button", name="确定").first
+                    if await btn.count():
+                        await btn.click(force=True)
+                    else:
+                        await page.get_by_role("button", name="确定").click(force=True)
+                    saw_confirm = True
+                    await page.wait_for_timeout(800)
+                    break
+            except Exception:
+                pass
+            if await page.locator(cover_locator_str).count() == 0:
+                break
+            await page.wait_for_timeout(400)
+
+        closed = False
+        for state in ("hidden", "detached"):
+            try:
+                await page.locator(cover_locator_str).first.wait_for(state=state, timeout=12000)
+                closed = True
+                break
+            except Exception:
+                continue
+        if not closed:
+            try:
+                await page.locator("div.dy-creator-content-modal").get_by_role(
+                    "button", name="确定", exact=True
+                ).first.click(force=True, timeout=2000)
+                await page.wait_for_timeout(800)
+                await page.locator(cover_locator_str).first.wait_for(state="hidden", timeout=5000)
+                closed = True
+                saw_confirm = True
+            except Exception:
+                pass
+        if not closed:
+            await self._dismiss_cover_modals(page)
+            douyin_logger.warning(
+                _msg("⚠️", "封面弹窗未正常关闭，已强制移除遮罩；自定义封面可能未生效")
+            )
+            return
+
+        await page.wait_for_timeout(800)
+        if await self._verify_cover_on_publish_page(page):
+            extra = "，含二次确认" if saw_confirm else ""
+            douyin_logger.info(_msg("🥳", f"视频封面设置完成（预览已确认{extra}）"))
+        else:
+            douyin_logger.warning(
+                _msg("⚠️", "封面弹窗已关，但发布页未见封面缩略图，自定义封面可能未生效")
+            )
 
     async def upload(self, playwright: Playwright) -> None:
         douyin_logger.info(_msg("🧍", "小人先检查 cookie、视频文件、封面和发布时间"))
@@ -936,12 +1187,16 @@ class DouYinVideo(DouYinBaseUploader):
         if self.publish_strategy == DOUYIN_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
             await self.set_schedule_time_douyin(page, self.publish_date)
 
-        while True:
+        for publish_try in range(120):
             try:
-                # 移除会拦截发布按钮点击的新手引导/话题下拉浮层
+                # 移除会拦截发布按钮点击的新手引导/话题下拉/封面遮罩
+                await self._dismiss_cover_modals(page)
                 await page.evaluate(
                     "() => { document.querySelectorAll('.shepherd-element, .shepherd-modal-overlay-container, [class*=\"mention-wrapper\"]').forEach(e => e.remove()); }"
                 )
+                # 自主声明未选时抖音会拦发布：补一次（已选则入口文案变化，函数内会快速跳过/失败）
+                if await page.get_by_text("请选择自主声明").count():
+                    await self.set_self_declaration(page)
                 publish_button = page.get_by_role("button", name="发布", exact=True)
                 if await publish_button.count():
                     await publish_button.click(force=True)
@@ -953,10 +1208,13 @@ class DouYinVideo(DouYinBaseUploader):
                 break
             except Exception:
                 await self.handle_auto_video_cover(page)
-                douyin_logger.info(_msg("🏃", "小人正在冲刺发布视频"))
+                if publish_try % 10 == 0:
+                    douyin_logger.info(_msg("🏃", f"小人正在冲刺发布视频（{publish_try + 1}/120）"))
                 if self.debug:
                     await page.screenshot(full_page=True)
                 await asyncio.sleep(0.5)
+        else:
+            raise RuntimeError("抖音发布超时：多次点击发布仍未进入作品管理页")
 
         await context.storage_state(path=self.account_file)
         douyin_logger.success(_msg("🥳", "cookie 更新完毕"))
