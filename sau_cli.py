@@ -225,7 +225,13 @@ def parse_schedule(raw_schedule: str | None) -> datetime | int:
 
 async def login_douyin_account(account_name: str, headless: bool = True) -> dict:
     account_file = resolve_account_file("douyin", account_name)
-    return await douyin_setup(str(account_file), handle=True, return_detail=True, headless=headless)
+    return await douyin_setup(
+        str(account_file),
+        handle=True,
+        return_detail=True,
+        headless=headless,
+        force_login=True,
+    )
 
 
 async def check_douyin_account(account_name: str) -> bool:
@@ -237,7 +243,13 @@ async def check_douyin_account(account_name: str) -> bool:
 
 async def login_kuaishou_account(account_name: str, headless: bool = True) -> dict:
     account_file = resolve_account_file("kuaishou", account_name)
-    return await ks_setup(str(account_file), handle=True, return_detail=True, headless=headless)
+    return await ks_setup(
+        str(account_file),
+        handle=True,
+        return_detail=True,
+        headless=headless,
+        force_login=True,
+    )
 
 
 async def check_kuaishou_account(account_name: str) -> bool:

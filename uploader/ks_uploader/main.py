@@ -174,8 +174,32 @@ async def cookie_auth(account_file):
             await browser.close()
 
 
-async def ks_setup(account_file, handle=False, return_detail=False, qrcode_callback=None, headless: bool = LOCAL_CHROME_HEADLESS, cdp_url: str | None = None):
+async def ks_setup(
+    account_file,
+    handle=False,
+    return_detail=False,
+    qrcode_callback=None,
+    headless: bool = LOCAL_CHROME_HEADLESS,
+    cdp_url: str | None = None,
+    force_login: bool = False,
+):
     account_file = get_absolute_path(account_file, "ks_uploader")
+    # 用户主动扫码：跳过 cookie 快检，强制重新登录
+    if force_login and handle:
+        kuaishou_logger.info(_msg("🧍", "强制扫码登录，跳过 cookie 快检"))
+        if os.path.exists(account_file):
+            try:
+                os.remove(account_file)
+            except OSError:
+                pass
+        result = await get_ks_cookie(
+            account_file,
+            qrcode_callback=qrcode_callback,
+            headless=headless,
+            cdp_url=cdp_url,
+        )
+        return result if return_detail else result["success"]
+
     if not os.path.exists(account_file) or not await cookie_auth(account_file):
         if not handle:
             result = _build_login_result(False, "cookie_invalid", "cookie文件不存在或已失效", account_file)

@@ -4,6 +4,8 @@ from datetime import datetime
 import asyncio
 import inspect
 import os
+import re
+import time
 from pathlib import Path
 
 from patchright.async_api import Page
@@ -529,18 +531,31 @@ class DouYinBaseUploader(BaseVideoUploader):
         # version_2(post/video) 发布页要等视频上传完才渲染表单（实测约 40s），故等待超时给到 120s
         title_input = page.locator('input[placeholder*="填写作品标题"]').first
         await title_input.wait_for(state="visible", timeout=120000)
-        await title_input.fill(title[:30])
+        await title_input.fill((title or "")[:30])
 
         description_editor = page.locator('div.zone-container[contenteditable="true"]').first
         await description_editor.wait_for(state="visible", timeout=120000)
         await description_editor.click()
-        await page.keyboard.press("Control+KeyA")
-        await page.keyboard.press("Delete")
+        await page.keyboard.press("Control+A")
+        await page.keyboard.press("Backspace")
+
+        # 先写简介正文（insert_text 整段粘贴，避免逐字过慢）
+        body = (description or "").strip()
+        if body:
+            # 抖音作品描述常见上限约 1000 字，留余量
+            await page.keyboard.insert_text(body[:1000])
+            douyin_logger.info(_msg("📝", f"已填入简介 {min(len(body), 1000)} 字"))
+        else:
+            douyin_logger.warning(_msg("⚠️", "简介为空，仅填写话题"))
 
         for tag in tags or []:
-            await page.keyboard.type(" #" + tag)
+            tag_text = str(tag).strip().lstrip("#")
+            if not tag_text:
+                continue
+            await page.keyboard.insert_text(f" #{tag_text}")
             await page.keyboard.press("Space")
         await page.keyboard.press("Escape")  # 收起话题下拉，避免浮层拦截后续点击
+        await asyncio.sleep(0.3)
 
     async def set_location(self, page: Page, location: str = ""):
         if not location:
@@ -651,6 +666,547 @@ class DouYinBaseUploader(BaseVideoUploader):
                   ).forEach(e => e.remove());
                 }"""
             )
+        except Exception:
+            pass
+
+    async def set_xingtu_task(self, page: Page, task_id: str) -> None:
+        """挂载星图任务：兼容「请选择星图任务」入口与旧版勾选+输入框。"""
+        raw = (task_id or "").strip()
+        if not raw:
+            raise ValueError("星图任务 ID/名称不能为空")
+
+        # 优先纯数字任务 ID（名称搜索在创作者中心经常找不到输入框/联想）
+        query = raw
+        m_chal = re.search(r"/challenge/(\d{6,})", raw)
+        if m_chal:
+            query = m_chal.group(1)
+        elif re.fullmatch(r"\d{6,}", raw):
+            query = raw
+        douyin_logger.info(_msg("⭐", f"星图挂载关键词: {query[:80]}"))
+
+        try:
+            await self._dismiss_cover_modals(page)
+        except Exception:
+            pass
+
+        # 懒加载：先滚到页面下部，星图入口常在设置区
+        try:
+            await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(600)
+            await page.evaluate("() => window.scrollBy(0, -400)")
+            await page.wait_for_timeout(300)
+        except Exception:
+            pass
+
+        opened = False
+
+        # 新版入口：按钮/文案「请选择星图任务」
+        for text in ("请选择星图任务", "选择星图任务", "关联星图任务", "添加星图任务"):
+            btn = page.get_by_text(text, exact=False).first
+            try:
+                if await btn.count() and await btn.is_visible():
+                    await btn.scroll_into_view_if_needed()
+                    await btn.click(force=True, timeout=5000)
+                    opened = True
+                    douyin_logger.info(_msg("⭐", f"已点击星图入口: {text}"))
+                    break
+            except Exception:
+                continue
+
+        # 旧版：勾选「星图任务」开关
+        if not opened:
+            label = page.get_by_text("星图任务", exact=True).first
+            if not await label.count():
+                label = page.get_by_text("星图任务", exact=False).first
+            await label.wait_for(state="visible", timeout=10000)
+            await label.scroll_into_view_if_needed()
+            row = page.locator("div,label,span,button").filter(
+                has_text=re.compile(r"^星图任务$|星图任务")
+            ).first
+            toggle = row.locator(
+                'input[type="checkbox"], .semi-checkbox, .semi-switch, '
+                '.semi-switch-native-control, [role="switch"]'
+            ).first
+            try:
+                if await toggle.count():
+                    await toggle.click(force=True, timeout=4000)
+                else:
+                    await label.click(force=True, timeout=4000)
+            except Exception:
+                await label.click(force=True)
+            opened = True
+            douyin_logger.info(_msg("⭐", "已勾选/点击「星图任务」"))
+
+        await asyncio.sleep(1.0)
+
+        # 弹层/下拉内的搜索框（可能挂在 body portal）
+        input_box = None
+        deadline = time.time() + 15
+        while time.time() < deadline and input_box is None:
+            candidates = [
+                page.get_by_placeholder(
+                    re.compile(
+                        r"任务\s*id|任务\s*ID|任务id或名称|任务名称|搜索任务|请输入任务|请选择|搜索",
+                        re.I,
+                    )
+                ),
+                page.locator(
+                    'input[placeholder*="任务"], input[placeholder*="搜索"], '
+                    'input[placeholder*="星图"]'
+                ),
+                page.locator(
+                    ".semi-modal input, .semi-portal input, .semi-select-option-list input, "
+                    ".semi-select-selection-search input, "
+                    '[class*="modal"] input[type="text"], [class*="popover"] input, '
+                    '[class*="dropdown"] input'
+                ),
+                page.locator('[role="dialog"] input, [role="listbox"] input, [role="combobox"]'),
+            ]
+            for loc in candidates:
+                try:
+                    n = await loc.count()
+                except Exception:
+                    continue
+                for i in range(min(n, 8)):
+                    el = loc.nth(i)
+                    try:
+                        if await el.is_visible():
+                            # 排除售价等无关框
+                            ph = (await el.get_attribute("placeholder")) or ""
+                            if "售价" in ph or "价格" in ph:
+                                continue
+                            input_box = el
+                            break
+                    except Exception:
+                        continue
+                if input_box is not None:
+                    break
+            if input_box is None:
+                await asyncio.sleep(0.4)
+
+        if input_box is None:
+            # 再点一次「请选择星图任务」后重试一轮短等待
+            retry_btn = page.get_by_text("请选择星图任务", exact=False).first
+            try:
+                if await retry_btn.count() and await retry_btn.is_visible():
+                    await retry_btn.click(force=True)
+                    await asyncio.sleep(0.8)
+                    input_box = page.locator(
+                        '.semi-modal input:visible, .semi-portal input:visible, '
+                        'input[placeholder*="任务"]:visible, input[placeholder*="搜索"]:visible'
+                    ).first
+                    if not await input_box.count():
+                        input_box = None
+                    elif not await input_box.is_visible():
+                        input_box = None
+            except Exception:
+                input_box = None
+
+        if input_box is None:
+            raise TimeoutError(
+                "未找到星图任务搜索/输入框。请确认创作者账号已开通星图，"
+                "发布页能看到「请选择星图任务」或「星图任务」开关，并尽量用星图任务ID发布"
+            )
+
+        # 整段填入并主动触发 input，避免 Semi 搜索框不联想
+        await input_box.click(force=True)
+        try:
+            await input_box.evaluate(
+                """(el, v) => {
+                  const setter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                  ).set;
+                  setter.call(el, v);
+                  el.dispatchEvent(new Event('input', { bubbles: true }));
+                  el.dispatchEvent(new Event('change', { bubbles: true }));
+                  el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'Enter' }));
+                }""",
+                query,
+            )
+        except Exception:
+            try:
+                await input_box.fill(query, timeout=8000)
+            except Exception:
+                await page.keyboard.insert_text(query)
+        douyin_logger.info(_msg("⭐", f"已填入星图搜索词（{len(query)} 字符）"))
+        # 等搜索结果渲染（接口慢时原先 1.5s 不够）
+        await asyncio.sleep(2.0)
+        for _ in range(30):
+            hit = await page.evaluate(
+                """(qid) => {
+                  const t = document.body ? document.body.innerText : '';
+                  return t.includes(qid) || t.includes(qid.slice(-8));
+                }""",
+                query,
+            )
+            if hit:
+                break
+            await asyncio.sleep(0.35)
+
+        clicked = await self._select_xingtu_result(page, query)
+        if not clicked:
+            douyin_logger.warning(_msg("⚠️", "未勾选到星图任务行，将导出 DOM 便于对照"))
+            await self._dump_xingtu_debug(page, query)
+            await self._dismiss_xingtu_overlays(page)
+            raise TimeoutError(
+                f"星图任务未勾选成功（ID={query}）。"
+                "请查看 logs/xingtu_debug_*.html / .png"
+            )
+
+        # 必须看到 radio 选中态再点确定（JS 空点会关弹窗但挂载失败）
+        if not await self._xingtu_radio_is_checked(page):
+            douyin_logger.warning(_msg("⚠️", "点击后未见 semi-radio-checked，再点一次"))
+            await self._select_xingtu_via_radio_card(page, query)
+            if not await self._xingtu_radio_is_checked(page):
+                await self._dump_xingtu_debug(page, query)
+                await self._dismiss_xingtu_overlays(page)
+                raise TimeoutError(
+                    f"星图 radio 未真正选中（ID={query}），已中止以免空点确定"
+                )
+
+        await asyncio.sleep(0.4)
+        confirmed = await self._confirm_xingtu_selection(page)
+        if not confirmed:
+            await self._dump_xingtu_debug(page, query)
+            await self._dismiss_xingtu_overlays(page)
+            raise TimeoutError("已勾选星图任务，但未找到可用的「确定」按钮（semi-modal-footer）")
+        douyin_logger.info(_msg("🥳", "已点击星图弹窗「确定」"))
+        await asyncio.sleep(0.8)
+
+        # 硬校验：入口不能还是「请选择星图任务」
+        if await self._xingtu_still_unmounted(page):
+            await self._dump_xingtu_debug(page, query)
+            await self._dismiss_xingtu_overlays(page)
+            raise TimeoutError(
+                f"星图挂载未生效：入口仍显示「请选择星图任务」（ID={query}）"
+            )
+        douyin_logger.info(_msg("🥳", "星图入口已变更，挂载成功"))
+
+    async def _xingtu_modal(self, page: Page):
+        """仅定位「选择星图任务」弹窗（避免命中页面其它 radio / card）。"""
+        modal = page.locator(".semi-modal").filter(
+            has=page.locator(".semi-modal-title", has_text="选择星图任务")
+        ).first
+        if await modal.count():
+            return modal
+        modal = page.locator(".semi-modal").filter(has_text="选择星图任务").first
+        if await modal.count():
+            return modal
+        return page.locator("#dialog-0.semi-modal, .semi-modal-small").first
+
+    async def _select_xingtu_result(self, page: Page, query: str) -> bool:
+        """双方案勾选星图任务（一律限定在星图弹窗内）：
+
+        A. card-container + label.semi-radio（当前主路径）
+        B. 下拉联想项（旧版兜底）
+        """
+        if await self._select_xingtu_via_radio_card(page, query):
+            return True
+        douyin_logger.info(_msg("🧭", "未命中星图 radio 卡片，尝试旧版联想项方案"))
+        if await self._select_xingtu_via_suggest_option(page, query):
+            return True
+        return False
+
+    async def _modal_radio_really_checked(self, modal) -> bool:
+        """弹窗内是否真实选中：checked class + inner-checked（选中后会出现 SVG）。"""
+        try:
+            label_ok = await modal.locator("label.semi-radio-checked").count() > 0
+            inner_ok = await modal.locator(".semi-radio-inner-checked").count() > 0
+            svg_ok = await modal.locator("svg.semi-icons-radio").count() > 0
+            return bool(label_ok and (inner_ok or svg_ok))
+        except Exception:
+            return False
+
+    async def _click_xingtu_card_radio(self, page: Page, modal, card) -> str | None:
+        """在星图弹窗内点选任务卡；只认弹窗内的真实选中态。"""
+        await card.scroll_into_view_if_needed()
+        await page.wait_for_timeout(200)
+
+        # 1) 弹窗内原生 label.click()（比 page.mouse 坐标更稳，且不误点页外节点）
+        try:
+            ok = await card.evaluate(
+                """(card) => {
+                  const label = card.querySelector('label.semi-radio');
+                  const display = card.querySelector('.semi-radio-inner-display');
+                  const input = card.querySelector('input[type="radio"]');
+                  if (display) display.click();
+                  if (label) label.click();
+                  else if (input) input.click();
+                  const checked = !!(label && label.classList.contains('semi-radio-checked'));
+                  const inner = !!card.querySelector('.semi-radio-inner-checked');
+                  const svg = !!card.querySelector('svg.semi-icons-radio');
+                  return checked && (inner || svg);
+                }"""
+            )
+            await page.wait_for_timeout(350)
+            if ok or await self._modal_radio_really_checked(modal):
+                return "label.click()"
+        except Exception as exc:
+            douyin_logger.debug(_msg("🔍", f"label.click 失败: {exc}"))
+
+        # 2) Playwright 点可见圆点 / label（限定在 card 内）
+        targets = [
+            ("inner-display", card.locator(".semi-radio-inner-display").first),
+            ("label.semi-radio", card.locator("label.semi-radio").first),
+            ("radio-container", card.locator('[class*="radio-container"]').first),
+            ("info-container", card.locator('[class*="info-container"]').first),
+        ]
+        for via, loc in targets:
+            try:
+                if not await loc.count() or not await loc.is_visible():
+                    continue
+                await loc.click(timeout=4000)
+                await page.wait_for_timeout(400)
+                if await self._modal_radio_really_checked(modal):
+                    return via
+            except Exception:
+                continue
+
+        # 3) 键盘：聚焦 radio 后空格
+        try:
+            radio = card.locator('input[type="radio"]').first
+            if await radio.count():
+                await radio.focus()
+                await page.keyboard.press("Space")
+                await page.wait_for_timeout(400)
+                if await self._modal_radio_really_checked(modal):
+                    return "keyboard-space"
+        except Exception:
+            pass
+        return None
+
+    async def _select_xingtu_via_radio_card(self, page: Page, query: str) -> bool:
+        """方案 A：只在「选择星图任务」弹窗内操作（修复页外 radio 误判）。"""
+        tail = query[-8:] if len(query) >= 8 else query
+        modal = await self._xingtu_modal(page)
+        try:
+            await modal.wait_for(state="visible", timeout=10000)
+        except Exception:
+            douyin_logger.warning(_msg("⚠️", "[方案A-radio] 未找到「选择星图任务」弹窗"))
+            return False
+
+        cards = modal.locator('[class*="card-container"]')
+        for _ in range(40):
+            try:
+                if await cards.count() > 0:
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(0.25)
+
+        n = await cards.count()
+        douyin_logger.info(_msg("⭐", f"[方案A-radio] 弹窗内任务卡片数={n}"))
+        if n <= 0:
+            return False
+
+        # 优先正文含 ID 的卡；否则首张（搜索结果通常只剩目标任务）
+        card = cards.filter(has_text=query).first
+        if not await card.count():
+            card = cards.filter(has_text=tail).first
+        if not await card.count():
+            card = cards.first
+
+        via = await self._click_xingtu_card_radio(page, modal, card)
+        if via and await self._modal_radio_really_checked(modal):
+            douyin_logger.info(_msg("🥳", f"[方案A-radio] 弹窗内真实选中（via={via}）"))
+            return True
+
+        # 再扫一遍弹窗内每张卡
+        for i in range(n):
+            via = await self._click_xingtu_card_radio(page, modal, cards.nth(i))
+            if via and await self._modal_radio_really_checked(modal):
+                douyin_logger.info(
+                    _msg("🥳", f"[方案A-radio] 弹窗内真实选中（第{i + 1}张, via={via}）")
+                )
+                return True
+
+        douyin_logger.warning(
+            _msg(
+                "⚠️",
+                "[方案A-radio] 弹窗内仍无 semi-radio-checked + inner-checked（圆点未亮）",
+            )
+        )
+        return False
+
+    async def _select_xingtu_via_suggest_option(self, page: Page, query: str) -> bool:
+        """方案 B：旧版下拉联想项（semi-select-option / role=option 等）。"""
+        tail = query[-8:] if len(query) >= 8 else query
+        option_roots = page.locator(
+            ".semi-select-option, .semi-list-item, [class*='option'], [class*='suggest'], "
+            "[role='option'], .semi-cascader-option, [class*='task-item'], [class*='TaskItem']"
+        )
+        option = option_roots.filter(has_text=query).first
+        if not await option.count():
+            option = option_roots.filter(has_text=tail).first
+
+        for _ in range(16):
+            try:
+                if await option.count() and await option.is_visible():
+                    break
+            except Exception:
+                pass
+            any_opt = option_roots.filter(has_text=re.compile(r"\d{6,}|星图|任务|推广")).first
+            try:
+                if await any_opt.count() and await any_opt.is_visible():
+                    option = any_opt
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(0.25)
+
+        try:
+            if await option.count() and await option.is_visible():
+                await option.click(force=True, timeout=5000)
+                douyin_logger.info(_msg("🥳", f"[方案B-联想] 已点击联想项（含 {tail}）"))
+                return True
+        except Exception as exc:
+            douyin_logger.warning(_msg("⚠️", f"[方案B-联想] 点击失败: {exc}"))
+
+        for cand in (
+            option_roots.filter(has_text=query).first,
+            option_roots.filter(has_text=tail).first,
+            option_roots.filter(has_text=re.compile(r"\d{10,}")).first,
+        ):
+            try:
+                if await cand.count() and await cand.is_visible():
+                    await cand.click(force=True, timeout=4000)
+                    douyin_logger.info(_msg("🥳", "[方案B-联想] 已点击匹配项"))
+                    return True
+            except Exception:
+                continue
+
+        # 最后：键盘选中（部分下拉只响应方向键）
+        try:
+            await page.keyboard.press("ArrowDown")
+            await asyncio.sleep(0.2)
+            await page.keyboard.press("Enter")
+            # 无法可靠判断是否生效，仅当页面上已有勾选/入口变化时算成功
+            await asyncio.sleep(0.4)
+            still = page.get_by_text("请选择星图任务", exact=False).first
+            if await still.count() and await still.is_visible():
+                douyin_logger.warning(_msg("⚠️", "[方案B-联想] 回车后入口仍为空，视为未选中"))
+                return False
+            douyin_logger.info(_msg("🥳", "[方案B-联想] 回车后入口文案已变化"))
+            return True
+        except Exception:
+            return False
+
+    async def _dump_xingtu_debug(self, page: Page, query: str) -> None:
+        """导出星图弹层 HTML/截图，便于对照真实 DOM。"""
+        try:
+            from pathlib import Path
+            from datetime import datetime
+
+            out_dir = Path(__file__).resolve().parents[4] / "backend" / "logs"
+            # social-auto-upload 可能在独立 cwd；回退到 cwd/logs
+            if not out_dir.is_dir():
+                out_dir = Path.cwd() / "logs"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            html_path = out_dir / f"xingtu_debug_{stamp}.html"
+            png_path = out_dir / f"xingtu_debug_{stamp}.png"
+            snippet = await page.evaluate(
+                """(qid) => {
+                  const modals = [...document.querySelectorAll('.semi-modal')];
+                  const pick = modals.find(m => (m.innerText || '').includes('选择星图任务'))
+                    || document.querySelector('#dialog-0')
+                    || modals[0];
+                  const html = pick
+                    ? pick.outerHTML.slice(0, 400000)
+                    : '';
+                  const checked = !!(pick && pick.querySelector('label.semi-radio-checked'));
+                  const inner = !!(pick && pick.querySelector('.semi-radio-inner-checked'));
+                  const svg = !!(pick && pick.querySelector('svg.semi-icons-radio'));
+                  return `<!-- query=${qid} url=${location.href} modal_checked=${checked} inner=${inner} svg=${svg} -->\\n` + html;
+                }""",
+                query,
+            )
+            html_path.write_text(snippet or "", encoding="utf-8", errors="ignore")
+            try:
+                await page.screenshot(path=str(png_path), full_page=False)
+            except Exception:
+                pass
+            douyin_logger.warning(
+                _msg("📎", f"星图调试已导出: {html_path.name} / {png_path.name}（目录 {out_dir}）")
+            )
+        except Exception as exc:
+            douyin_logger.warning(_msg("⚠️", f"导出星图调试失败: {exc}"))
+
+    async def _xingtu_radio_is_checked(self, page: Page) -> bool:
+        """仅检查「选择星图任务」弹窗内的真实选中态（勿扫全页其它 radio）。"""
+        try:
+            modal = await self._xingtu_modal(page)
+            if not await modal.count() or not await modal.is_visible():
+                return False
+            return await self._modal_radio_really_checked(modal)
+        except Exception:
+            return False
+
+    async def _xingtu_still_unmounted(self, page: Page) -> bool:
+        """发布页星图入口是否仍为未选择状态（排除弹窗标题「选择星图任务」）。"""
+        try:
+            # 弹窗还开着时不算「已挂载失败」的最终态，先以入口文案为准
+            tip = page.locator("body").get_by_text("请选择星图任务", exact=True).first
+            if await tip.count() and await tip.is_visible():
+                return True
+            # 宽松：发布页扩展信息区仍显示请选择
+            tip2 = page.get_by_text("请选择星图任务", exact=False).first
+            if not await tip2.count() or not await tip2.is_visible():
+                return False
+            # 若点中的是弹窗标题「选择星图任务」，不算未挂载入口
+            txt = (await tip2.inner_text() or "").strip()
+            return txt.startswith("请选择") or "请选择星图任务" in txt
+        except Exception:
+            return False
+
+    async def _confirm_xingtu_selection(self, page: Page) -> bool:
+        """只点星图弹窗 footer 的 primary「确定」。"""
+        modal = await self._xingtu_modal(page)
+        try:
+            if not await modal.count() or not await modal.is_visible():
+                return False
+            # 确定前再确认弹窗内已选中
+            if not await self._modal_radio_really_checked(modal):
+                douyin_logger.warning(_msg("⚠️", "弹窗内任务未选中，拒绝点击确定"))
+                return False
+            btn = modal.locator("div.semi-modal-footer button.semi-button-primary").filter(
+                has_text=re.compile(r"^确定$")
+            ).first
+            if not await btn.count():
+                btn = modal.get_by_role("button", name="确定", exact=True).first
+            if not await btn.count() or not await btn.is_visible():
+                return False
+            cls = (await btn.get_attribute("class")) or ""
+            if "semi-button-disabled" in cls:
+                douyin_logger.warning(_msg("⚠️", "星图「确定」按钮禁用"))
+                return False
+            await btn.click(timeout=5000)
+            await page.wait_for_timeout(600)
+            return True
+        except Exception as exc:
+            douyin_logger.warning(_msg("⚠️", f"点击星图确定失败: {exc}"))
+            return False
+
+    async def _dismiss_xingtu_overlays(self, page: Page) -> None:
+        """关闭星图选择残留层：只点取消/Esc，绝不点确定。"""
+        try:
+            cancel = page.locator("div.semi-modal-footer button.semi-button-tertiary").filter(
+                has_text=re.compile(r"^取消$")
+            ).first
+            if await cancel.count() and await cancel.is_visible():
+                await cancel.click(force=True, timeout=3000)
+                await page.wait_for_timeout(300)
+        except Exception:
+            pass
+        for _ in range(2):
+            try:
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(250)
+            except Exception:
+                break
+        try:
+            await page.mouse.click(40, 120)
+            await page.wait_for_timeout(200)
         except Exception:
             pass
 
@@ -788,6 +1344,7 @@ class DouYinVideo(DouYinBaseUploader):
         publish_strategy: str = DOUYIN_PUBLISH_STRATEGY_IMMEDIATE,
         debug: bool = DEBUG_MODE,
         headless: bool = LOCAL_CHROME_HEADLESS,
+        xingtu_task_id: str | None = None,
     ):
         super().__init__(
             publish_date=publish_date,
@@ -804,6 +1361,7 @@ class DouYinVideo(DouYinBaseUploader):
         self.productLink = productLink
         self.productTitle = productTitle
         self.desc = desc or ""
+        self.xingtu_task_id = (xingtu_task_id or "").strip()
 
     async def validate_upload_args(self):
         await self.validate_base_args()
@@ -959,13 +1517,147 @@ class DouYinVideo(DouYinBaseUploader):
             return
 
         douyin_logger.info(_msg("🏃", "小人正在设置视频封面"))
+        try:
+            await self._set_thumbnail_inner(page)
+        except Exception as exc:
+            # 封面失败不应整单失败：后续可用推荐封面 / 无封面继续发布
+            douyin_logger.warning(_msg("⚠️", f"自定义封面设置失败，跳过继续发布: {exc}"))
+            try:
+                await self._dismiss_cover_modals(page)
+            except Exception:
+                pass
+
+    async def _wait_cover_modal(self, page: Page, timeout_ms: int = 20000):
+        """兼容抖音创作者中心封面弹层 class 变更（对齐视频号：多标题/多选择器）。"""
+        selectors = (
+            "div.dy-creator-content-modal",
+            "div.dy-creator-content-modal-wrap",
+            "[class*='dy-creator-content-modal']",
+            "[class*='creator-content-modal']",
+            "[class*='cover-modal']",
+            "[class*='CoverModal']",
+            "div.semi-modal.semi-modal-open",
+            ".semi-modal:visible",
+            "[role='dialog']:visible",
+        )
+        title_pat = re.compile(r"设置封面|选择封面|上传封面|竖封面|横封面|编辑封面|完成")
+        deadline = time.time() + timeout_ms / 1000.0
+        while time.time() < deadline:
+            for sel in selectors:
+                try:
+                    texted = page.locator(sel).filter(has_text=title_pat).first
+                    if await texted.count() and await texted.is_visible():
+                        return texted
+                    loc = page.locator(sel).first
+                    if await loc.count() and await loc.is_visible():
+                        # 有 file input 或「完成」按钮也视为封面弹层
+                        has_file = await loc.locator("input[type='file']").count()
+                        has_finish = await loc.get_by_text("完成", exact=True).count()
+                        if has_file or has_finish:
+                            return loc
+                except Exception:
+                    continue
+            await asyncio.sleep(0.35)
+        return None
+
+    async def _click_cover_entry(self, page: Page) -> bool:
+        """多入口尝试打开封面编辑（参考视频号 open_thumbnail_dialog 多 selector）。"""
+        entry_candidates = [
+            page.get_by_role("button", name=re.compile(r"选择封面|设置封面|编辑封面")),
+            page.get_by_text("选择封面", exact=True),
+            page.get_by_text("设置封面", exact=True),
+            page.get_by_text("编辑封面", exact=True),
+            page.locator("[class*='cover']").filter(has_text=re.compile(r"选择封面|设置封面")).first,
+            page.locator("div,span,button").filter(has_text=re.compile(r"^选择封面$")).first,
+            # 封面预览缩略图区域（有时点图才能打开）
+            page.locator("[class*='cover-'] img, [class*='Cover'] img, [class*='select-cover']").first,
+        ]
+        for loc in entry_candidates:
+            try:
+                target = loc.first if hasattr(loc, "first") else loc
+                if not await target.count():
+                    continue
+                if not await target.is_visible():
+                    continue
+                await target.scroll_into_view_if_needed()
+                await target.click(force=True, timeout=4000)
+                await page.wait_for_timeout(400)
+                return True
+            except Exception:
+                continue
+        # 最后用 JS 点含「选择封面」的可点击节点
+        try:
+            clicked = await page.evaluate(
+                """() => {
+                  const nodes = [...document.querySelectorAll('button,div,span,a')];
+                  const el = nodes.find(n => {
+                    const t = (n.textContent || '').trim();
+                    return t === '选择封面' || t === '设置封面' || t === '编辑封面';
+                  });
+                  if (!el) return false;
+                  el.click();
+                  return true;
+                }"""
+            )
+            return bool(clicked)
+        except Exception:
+            return False
+
+    async def _set_thumbnail_inner(self, page: Page):
         await page.evaluate(
             "() => document.querySelectorAll('.shepherd-element,.shepherd-modal-overlay-container').forEach(e=>e.remove())"
         )
-        await page.get_by_text("选择封面", exact=True).first.click(force=True)
+        # 星图残留弹层会挡住封面入口（日志里常表现为「封面弹窗未出现」）
+        try:
+            await self._dismiss_xingtu_overlays(page)
+        except Exception:
+            pass
+
+        # 恢复 7/26 可用路径：点「选择封面」→ 等 dy-creator-content-modal（再兜底多入口）
         cover_locator_str = "div.dy-creator-content-modal"
-        cover_locator = page.locator(cover_locator_str).first
-        await page.wait_for_selector(cover_locator_str, timeout=20000)
+        cover_locator = None
+        # 滚到封面区域（星图操作后页面常停在底部，入口偶发点不到）
+        try:
+            await page.evaluate(
+                """() => {
+                  const el = [...document.querySelectorAll('div,span,button')]
+                    .find(n => (n.textContent || '').trim() === '选择封面');
+                  if (el) el.scrollIntoView({ block: 'center' });
+                }"""
+            )
+            await page.wait_for_timeout(400)
+        except Exception:
+            pass
+
+        for attempt in range(4):
+            try:
+                entry = page.get_by_text("选择封面", exact=True).first
+                await entry.wait_for(state="visible", timeout=12000)
+                await entry.scroll_into_view_if_needed()
+                await entry.click(force=True)
+                await page.wait_for_selector(cover_locator_str, state="visible", timeout=12000)
+                cover_locator = page.locator(cover_locator_str).first
+                douyin_logger.info(_msg("🖼️", f"已打开封面弹窗（经典选择器，第{attempt + 1}次）"))
+                break
+            except Exception as exc:
+                douyin_logger.warning(
+                    _msg("⚠️", f"经典封面入口失败({attempt + 1}/4): {exc}")
+                )
+                try:
+                    await self._dismiss_xingtu_overlays(page)
+                except Exception:
+                    pass
+                opened = await self._click_cover_entry(page)
+                if opened:
+                    cover_locator = await self._wait_cover_modal(page, timeout_ms=10000)
+                    if cover_locator is not None:
+                        douyin_logger.info(_msg("🖼️", "已打开封面弹窗（多入口兜底）"))
+                        break
+                await page.wait_for_timeout(800)
+
+        if cover_locator is None:
+            raise TimeoutError("未找到封面设置弹窗（class 可能已变更）")
+
         await page.wait_for_timeout(1200)
 
         thumb_path = self.thumbnail_portrait_path or self.thumbnail_landscape_path
@@ -997,17 +1689,20 @@ class DouYinVideo(DouYinBaseUploader):
                 pass
 
         before = await self._cover_preview_state(cover_locator)
-        uploaded = await self._upload_cover_via_file_chooser(page, cover_locator, thumb_path)
-        if uploaded:
-            preview_ok = False
-            for _ in range(30):
-                if self._cover_preview_ready(await self._cover_preview_state(cover_locator), before):
-                    preview_ok = True
-                    break
-                await asyncio.sleep(0.4)
-            uploaded = preview_ok
+        # 优先直接塞 file input（不弹系统资源管理器）；fileChooser 作兜底
+        uploaded = await self._upload_cover_via_inputs(cover_locator, thumb_path)
         if not uploaded:
-            uploaded = await self._upload_cover_via_inputs(cover_locator, thumb_path)
+            uploaded = await self._upload_cover_via_file_chooser(page, cover_locator, thumb_path)
+            if uploaded:
+                preview_ok = False
+                for _ in range(30):
+                    if self._cover_preview_ready(await self._cover_preview_state(cover_locator), before):
+                        preview_ok = True
+                        break
+                    await asyncio.sleep(0.4)
+                uploaded = preview_ok
+        else:
+            douyin_logger.info(_msg("🔍", "封面已通过 file input 注入（无系统文件框）"))
 
         if not uploaded:
             douyin_logger.error(_msg("😵", "自定义封面未能进入预览区，放弃点完成以免空关弹窗"))
@@ -1029,54 +1724,63 @@ class DouYinVideo(DouYinBaseUploader):
         await finish_btn.click()
         douyin_logger.info(_msg("🥳", "已点击封面完成"))
 
+        # 二次确认：「是否确认应用此封面？」——漏点确定会导致最终无封面
         saw_confirm = False
-        for _ in range(15):
+        for _ in range(25):
             try:
-                confirm = page.get_by_text("是否确认应用此封面？").first
-                if await confirm.is_visible():
+                confirm = page.get_by_text("是否确认应用此封面？", exact=False).first
+                if await confirm.count() and await confirm.is_visible():
                     douyin_logger.info(_msg("🪟", "弹出确认框: 是否确认应用此封面？"))
-                    modal = page.locator("div.dy-creator-content-modal").filter(
-                        has_text="是否确认应用此封面？"
-                    ).first
-                    btn = modal.get_by_role("button", name="确定").first
-                    if await btn.count():
-                        await btn.click(force=True)
-                    else:
-                        await page.get_by_role("button", name="确定").click(force=True)
+                    btn = page.get_by_role("button", name="确定", exact=True).first
+                    if not await btn.count():
+                        btn = page.locator("button").filter(has_text="确定").first
+                    await btn.click(force=True, timeout=5000)
                     saw_confirm = True
-                    await page.wait_for_timeout(800)
+                    await page.wait_for_timeout(1000)
                     break
             except Exception:
                 pass
-            if await page.locator(cover_locator_str).count() == 0:
+            # 弹窗已关则无需确认
+            try:
+                if await page.locator(cover_locator_str).count() == 0:
+                    break
+                visible_modal = page.locator("div.dy-creator-content-modal").first
+                if await visible_modal.count() and not await visible_modal.is_visible():
+                    break
+            except Exception:
                 break
             await page.wait_for_timeout(400)
 
         closed = False
         for state in ("hidden", "detached"):
             try:
-                await page.locator(cover_locator_str).first.wait_for(state=state, timeout=12000)
+                await page.locator(cover_locator_str).first.wait_for(state=state, timeout=10000)
                 closed = True
                 break
             except Exception:
                 continue
         if not closed:
+            # 再试一次确定，避免强删 DOM 把未确认封面冲掉
             try:
-                await page.locator("div.dy-creator-content-modal").get_by_role(
-                    "button", name="确定", exact=True
-                ).first.click(force=True, timeout=2000)
-                await page.wait_for_timeout(800)
-                await page.locator(cover_locator_str).first.wait_for(state="hidden", timeout=5000)
-                closed = True
-                saw_confirm = True
+                btn = page.get_by_role("button", name="确定", exact=True).first
+                if await btn.count() and await btn.is_visible():
+                    await btn.click(force=True, timeout=3000)
+                    saw_confirm = True
+                    await page.wait_for_timeout(800)
+                    await page.locator(cover_locator_str).first.wait_for(state="hidden", timeout=5000)
+                    closed = True
             except Exception:
                 pass
         if not closed:
-            await self._dismiss_cover_modals(page)
+            # 最后才 Escape（不要 DOM remove，否则封面确认会被吞掉）
+            try:
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(500)
+            except Exception:
+                pass
             douyin_logger.warning(
-                _msg("⚠️", "封面弹窗未正常关闭，已强制移除遮罩；自定义封面可能未生效")
+                _msg("⚠️", "封面弹窗未正常关闭；若未点到「确定」，自定义封面可能未生效")
             )
-            return
 
         await page.wait_for_timeout(800)
         if await self._verify_cover_on_publish_page(page):
@@ -1155,6 +1859,7 @@ class DouYinVideo(DouYinBaseUploader):
         await self.fill_title_and_description(page, self.title, self.desc or self.title, self.tags)
         douyin_logger.info(_msg("🏷️", f"小人一共贴了 {len(self.tags)} 个话题"))
 
+        # 必须等视频传完再挂星图/设封面：传完前「选择封面」常不可用，星图弹层失败还会遮挡封面
         while True:
             try:
                 number = await page.locator('[class^="long-card"] div:has-text("重新上传")').count()
@@ -1170,11 +1875,31 @@ class DouYinVideo(DouYinBaseUploader):
                 douyin_logger.debug(_msg("🧍", "小人还在等视频上传完成"))
                 await asyncio.sleep(2)
 
+        if self.xingtu_task_id:
+            douyin_logger.info(_msg("⭐", f"小人开始挂载星图任务: {self.xingtu_task_id}"))
+            try:
+                await self.set_xingtu_task(page, self.xingtu_task_id)
+                douyin_logger.info(_msg("🥳", "星图任务挂载成功"))
+            except Exception as exc:
+                # 矩阵/机会中心带星图 ID 时：挂载失败必须中止，禁止无星图发布
+                try:
+                    await self._dismiss_xingtu_overlays(page)
+                except Exception:
+                    pass
+                douyin_logger.error(_msg("😵", f"星图挂载失败，中止发布: {exc}"))
+                raise RuntimeError(f"星图任务挂载失败，已中止发布: {exc}") from exc
+
         if self.productLink and self.productTitle:
             douyin_logger.info(_msg("🛒", "小人正在设置商品链接"))
             await self.set_product_link(page, self.productLink, self.productTitle)
             douyin_logger.info(_msg("🥳", "商品链接设置完成"))
 
+        # 星图弹层彻底关掉后再设封面，避免挡住「选择封面」
+        try:
+            await self._dismiss_xingtu_overlays(page)
+            await page.wait_for_timeout(500)
+        except Exception:
+            pass
         await self.set_thumbnail(page)
 
         await self.set_self_declaration(page)
