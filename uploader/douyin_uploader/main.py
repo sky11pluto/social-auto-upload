@@ -526,6 +526,50 @@ class DouYinBaseUploader(BaseVideoUploader):
         await page.keyboard.press("Enter")
         await asyncio.sleep(1)
 
+    async def _focus_description_editor(self, page: Page):
+        """聚焦作品简介编辑器。发布页常有浮层拦截普通 click，需多策略兜底。"""
+        candidates = [
+            page.locator('div.zone-container[contenteditable="true"][data-placeholder*="简介"]').first,
+            page.locator('div.zone-container[contenteditable="true"]').first,
+            page.locator('[data-slate-editor="true"][contenteditable="true"]').first,
+            page.locator('div[contenteditable="true"][data-placeholder*="简介"]').first,
+        ]
+        last_err = None
+        for editor in candidates:
+            try:
+                if await editor.count() == 0:
+                    continue
+                await editor.wait_for(state="visible", timeout=120000)
+                # 1) 普通点击
+                try:
+                    await editor.click(timeout=8000)
+                    return editor
+                except Exception as exc:
+                    last_err = exc
+                    douyin_logger.warning(_msg("⚠️", f"简介框普通点击失败，尝试 force: {exc}"))
+                # 2) force 点击（绕过遮挡层）
+                try:
+                    await editor.click(force=True, timeout=8000)
+                    return editor
+                except Exception as exc:
+                    last_err = exc
+                # 3) 直接 focus + 再点一次坐标中心
+                try:
+                    await editor.focus(timeout=5000)
+                    box = await editor.bounding_box()
+                    if box:
+                        await page.mouse.click(
+                            box["x"] + box["width"] / 2,
+                            box["y"] + min(24.0, box["height"] / 2),
+                        )
+                    return editor
+                except Exception as exc:
+                    last_err = exc
+            except Exception as exc:
+                last_err = exc
+                continue
+        raise RuntimeError(f"无法聚焦作品简介编辑框: {last_err}")
+
     async def fill_title_and_description(self, page: Page, title: str, description: str, tags: list[str] | None = None):
         # 2026-06 抖音发布页 DOM：标题=input[placeholder*=填写作品标题]，描述=div.zone-container[contenteditable]
         # version_2(post/video) 发布页要等视频上传完才渲染表单（实测约 40s），故等待超时给到 120s
@@ -533,9 +577,14 @@ class DouYinBaseUploader(BaseVideoUploader):
         await title_input.wait_for(state="visible", timeout=120000)
         await title_input.fill((title or "")[:30])
 
-        description_editor = page.locator('div.zone-container[contenteditable="true"]').first
-        await description_editor.wait_for(state="visible", timeout=120000)
-        await description_editor.click()
+        # 关掉可能挡住简介框的提示/下拉
+        try:
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.2)
+        except Exception:
+            pass
+
+        await self._focus_description_editor(page)
         await page.keyboard.press("Control+A")
         await page.keyboard.press("Backspace")
 
@@ -1527,6 +1576,251 @@ class DouYinVideo(DouYinBaseUploader):
             except Exception:
                 pass
 
+    def _derive_landscape_4x3(self, src_path: str) -> str:
+        """从竖图中心裁出 4:3 横封面；无 Pillow 时回退原图交给抖音裁切。"""
+        src = Path(src_path)
+        if not src.is_file():
+            return src_path
+        try:
+            from PIL import Image
+        except ImportError:
+            douyin_logger.info(_msg("🧭", "未安装 Pillow，横封面沿用原图（由抖音裁切）"))
+            return src_path
+        try:
+            with Image.open(src) as im0:
+                im = im0.convert("RGB")
+                w, h = im.size
+                if w <= 0 or h <= 0:
+                    return src_path
+                target = 4 / 3
+                cur = w / h
+                if abs(cur - target) < 0.03:
+                    return src_path
+                if cur > target:
+                    new_w = max(1, int(h * target))
+                    left = (w - new_w) // 2
+                    im = im.crop((left, 0, left + new_w, h))
+                else:
+                    new_h = max(1, int(w / target))
+                    top = (h - new_h) // 2
+                    im = im.crop((0, top, w, top + new_h))
+                out = Path(os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp") / (
+                    f"douyin_cover_4x3_{os.getpid()}_{int(time.time())}.jpg"
+                )
+                im.save(out, quality=92)
+                douyin_logger.info(_msg("🧭", f"已生成横封面 4:3: {out}"))
+                return str(out)
+        except Exception as exc:
+            douyin_logger.warning(_msg("⚠️", f"生成横封面失败，沿用原图: {exc}"))
+            return src_path
+
+    async def _switch_cover_orientation(self, cover_locator, orientation: str) -> None:
+        """切换竖封面 3:4 / 横封面 4:3。"""
+        labels = (
+            ("设置竖封面", "竖封面", "竖封面3:4", "3:4")
+            if orientation == "portrait"
+            else ("设置横封面", "横封面", "横封面4:3", "4:3")
+        )
+        for name in labels:
+            try:
+                tab = cover_locator.get_by_text(name, exact=True).first
+                if await tab.count() and await tab.is_visible():
+                    await tab.click(force=True, timeout=3000)
+                    await asyncio.sleep(0.5)
+                    douyin_logger.info(_msg("🧭", f"已切换到「{name}」"))
+                    return
+            except Exception:
+                continue
+        pat = re.compile(r"竖封面|3\s*:\s*4") if orientation == "portrait" else re.compile(
+            r"横封面|4\s*:\s*3"
+        )
+        try:
+            tab = cover_locator.get_by_text(pat).first
+            if await tab.count() and await tab.is_visible():
+                await tab.click(force=True, timeout=3000)
+                await asyncio.sleep(0.5)
+                douyin_logger.info(
+                    _msg(
+                        "🧭",
+                        f"已切换到{'竖' if orientation == 'portrait' else '横'}封面（模糊匹配）",
+                    )
+                )
+        except Exception:
+            pass
+
+    async def _switch_cover_upload_tab(self, cover_locator) -> None:
+        for tab_name in ("上传封面", "本地上传"):
+            try:
+                tab = cover_locator.get_by_text(tab_name, exact=True).first
+                if await tab.count() and await tab.is_visible():
+                    await tab.click(force=True)
+                    await asyncio.sleep(0.6)
+                    douyin_logger.info(_msg("🧭", f"已切换封面页签「{tab_name}」"))
+                    return
+            except Exception:
+                continue
+
+    async def _inject_cover_file(self, page: Page, cover_locator, thumb_path: str) -> bool:
+        before = await self._cover_preview_state(cover_locator)
+        uploaded = await self._upload_cover_via_inputs(cover_locator, thumb_path)
+        if uploaded:
+            douyin_logger.info(_msg("🔍", "封面已通过 file input 注入（无系统文件框）"))
+            return True
+        uploaded = await self._upload_cover_via_file_chooser(page, cover_locator, thumb_path)
+        if not uploaded:
+            return False
+        for _ in range(30):
+            if self._cover_preview_ready(await self._cover_preview_state(cover_locator), before):
+                return True
+            await asyncio.sleep(0.4)
+        return False
+
+    async def _click_cover_finish(self, page: Page, cover_locator) -> None:
+        finish_btn = cover_locator.get_by_role("button", name="完成", exact=True).first
+        for _ in range(40):
+            try:
+                if await finish_btn.count() and await finish_btn.is_enabled():
+                    break
+            except Exception:
+                pass
+            await page.wait_for_timeout(500)
+        await finish_btn.click(force=True, timeout=8000)
+        douyin_logger.info(_msg("🥳", "已点击封面完成"))
+        await page.wait_for_timeout(600)
+
+    async def _detect_landscape_cover_step(self, page: Page, cover_locator) -> bool:
+        """竖封面完成后，抖音常停留在「继续设置横封面 4:3」步骤。"""
+        patterns = [
+            re.compile(r"继续.*(横封面|上传|设置)"),
+            re.compile(r"(设置|上传).*(横封面|4\s*:\s*3)"),
+            re.compile(r"横封面\s*4\s*:\s*3"),
+            re.compile(r"是否继续"),
+        ]
+        try:
+            text = (await cover_locator.inner_text(timeout=1500)) or ""
+        except Exception:
+            text = ""
+        for pat in patterns:
+            if pat.search(text):
+                return True
+        for name in ("设置横封面", "横封面", "横封面4:3"):
+            try:
+                el = cover_locator.get_by_text(name, exact=True).first
+                if await el.count() and await el.is_visible():
+                    return True
+            except Exception:
+                continue
+        try:
+            tip = page.get_by_text(re.compile(r"继续.*(横封面|上传)|横封面.*4\s*:\s*3")).first
+            if await tip.count() and await tip.is_visible():
+                return True
+        except Exception:
+            pass
+        return False
+
+    async def _accept_continue_landscape_prompt(self, page: Page) -> bool:
+        """点「继续」进入横封面。"""
+        continue_names = ("继续设置", "继续上传", "去设置", "继续", "设置横封面")
+        for name in continue_names:
+            try:
+                btn = page.get_by_role("button", name=name, exact=True).first
+                if not await btn.count():
+                    btn = page.locator("button,div[role='button'],span").filter(
+                        has_text=re.compile(rf"^{re.escape(name)}$")
+                    ).first
+                if await btn.count() and await btn.is_visible():
+                    await btn.click(force=True, timeout=4000)
+                    douyin_logger.info(_msg("🪟", f"已确认继续横封面: {name}"))
+                    await page.wait_for_timeout(700)
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _skip_landscape_cover_prompt(self, page: Page) -> bool:
+        """无横封面素材时跳过继续上传，避免卡在双封面步骤。"""
+        skip_names = ("暂不设置", "暂不上传", "跳过", "稍后再说", "取消", "不设置", "仅使用竖封面")
+        for name in skip_names:
+            try:
+                btn = page.get_by_role("button", name=name, exact=True).first
+                if not await btn.count():
+                    btn = page.locator("button,div[role='button']").filter(
+                        has_text=re.compile(rf"^{re.escape(name)}$")
+                    ).first
+                if await btn.count() and await btn.is_visible():
+                    await btn.click(force=True, timeout=4000)
+                    douyin_logger.info(_msg("🪟", f"已跳过横封面步骤: {name}"))
+                    await page.wait_for_timeout(700)
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _handle_after_cover_finish(
+        self,
+        page: Page,
+        cover_locator,
+        *,
+        prefer_landscape: bool,
+    ) -> str:
+        """
+        点「完成」后的后续态：
+        confirmed / landscape / skipped_landscape / closed / unknown
+        """
+        cover_locator_str = "div.dy-creator-content-modal"
+        for _ in range(20):
+            try:
+                confirm = page.get_by_text("是否确认应用此封面？", exact=False).first
+                if await confirm.count() and await confirm.is_visible():
+                    douyin_logger.info(_msg("🪟", "弹出确认框: 是否确认应用此封面？"))
+                    btn = page.get_by_role("button", name="确定", exact=True).first
+                    if not await btn.count():
+                        btn = page.locator("button").filter(has_text="确定").first
+                    await btn.click(force=True, timeout=5000)
+                    await page.wait_for_timeout(800)
+                    return "confirmed"
+            except Exception:
+                pass
+
+            try:
+                if await page.locator(cover_locator_str).count() == 0:
+                    return "closed"
+                visible_modal = page.locator(cover_locator_str).first
+                if await visible_modal.count() and not await visible_modal.is_visible():
+                    return "closed"
+            except Exception:
+                pass
+
+            if await self._detect_landscape_cover_step(page, cover_locator):
+                if prefer_landscape:
+                    await self._accept_continue_landscape_prompt(page)
+                    return "landscape"
+                if await self._skip_landscape_cover_prompt(page):
+                    return "skipped_landscape"
+                return "landscape"
+
+            await page.wait_for_timeout(350)
+        return "unknown"
+
+    async def _upload_cover_orientation(
+        self,
+        page: Page,
+        cover_locator,
+        thumb_path: str,
+        orientation: str,
+    ) -> bool:
+        label = "竖版3:4" if orientation == "portrait" else "横版4:3"
+        await self._switch_cover_orientation(cover_locator, orientation)
+        await self._switch_cover_upload_tab(cover_locator)
+        ok = await self._inject_cover_file(page, cover_locator, thumb_path)
+        if not ok:
+            douyin_logger.error(_msg("😵", f"{label}封面未能进入预览区"))
+            return False
+        douyin_logger.info(_msg("🖼️", f"{label}封面预览已就绪: {thumb_path}"))
+        await page.wait_for_timeout(600)
+        await self._click_cover_finish(page, cover_locator)
+        return True
+
     async def _wait_cover_modal(self, page: Page, timeout_ms: int = 20000):
         """兼容抖音创作者中心封面弹层 class 变更（对齐视频号：多标题/多选择器）。"""
         selectors = (
@@ -1603,20 +1897,56 @@ class DouYinVideo(DouYinBaseUploader):
         except Exception:
             return False
 
+    async def _close_cover_modal(self, page: Page, *, saw_confirm: bool) -> bool:
+        cover_locator_str = "div.dy-creator-content-modal"
+        closed = False
+        for state in ("hidden", "detached"):
+            try:
+                await page.locator(cover_locator_str).first.wait_for(state=state, timeout=8000)
+                closed = True
+                break
+            except Exception:
+                continue
+        if not closed:
+            try:
+                btn = page.get_by_role("button", name="确定", exact=True).first
+                if await btn.count() and await btn.is_visible():
+                    await btn.click(force=True, timeout=3000)
+                    await page.wait_for_timeout(800)
+                    await page.locator(cover_locator_str).first.wait_for(state="hidden", timeout=5000)
+                    closed = True
+            except Exception:
+                pass
+        if not closed:
+            try:
+                if await self._skip_landscape_cover_prompt(page):
+                    await page.wait_for_timeout(800)
+                    await page.locator(cover_locator_str).first.wait_for(state="hidden", timeout=5000)
+                    closed = True
+            except Exception:
+                pass
+        if not closed:
+            try:
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(500)
+            except Exception:
+                pass
+            douyin_logger.warning(
+                _msg("⚠️", "封面弹窗未正常关闭；若未点到「确定」，自定义封面可能未生效")
+            )
+        return closed
+
     async def _set_thumbnail_inner(self, page: Page):
         await page.evaluate(
             "() => document.querySelectorAll('.shepherd-element,.shepherd-modal-overlay-container').forEach(e=>e.remove())"
         )
-        # 星图残留弹层会挡住封面入口（日志里常表现为「封面弹窗未出现」）
         try:
             await self._dismiss_xingtu_overlays(page)
         except Exception:
             pass
 
-        # 恢复 7/26 可用路径：点「选择封面」→ 等 dy-creator-content-modal（再兜底多入口）
         cover_locator_str = "div.dy-creator-content-modal"
         cover_locator = None
-        # 滚到封面区域（星图操作后页面常停在底部，入口偶发点不到）
         try:
             await page.evaluate(
                 """() => {
@@ -1660,127 +1990,69 @@ class DouYinVideo(DouYinBaseUploader):
 
         await page.wait_for_timeout(1200)
 
-        thumb_path = self.thumbnail_portrait_path or self.thumbnail_landscape_path
-        if self.thumbnail_portrait_path:
-            try:
-                await cover_locator.get_by_text("设置竖封面", exact=True).first.click(timeout=3000)
-                await page.wait_for_timeout(600)
-            except Exception:
-                pass
-            orientation = "竖版"
-        else:
-            try:
-                await cover_locator.get_by_text("设置横封面", exact=True).first.click(timeout=3000)
-                await page.wait_for_timeout(600)
-            except Exception:
-                pass
-            orientation = "横版"
+        portrait_path = self.thumbnail_portrait_path
+        landscape_path = self.thumbnail_landscape_path
+        if portrait_path and not landscape_path:
+            landscape_path = self._derive_landscape_4x3(portrait_path)
+        elif landscape_path and not portrait_path:
+            portrait_path = landscape_path
 
-        # 先切到「上传封面」页签，避免塞进 AI 参考/推荐帧
-        for tab_name in ("上传封面", "本地上传"):
-            try:
-                tab = cover_locator.get_by_text(tab_name, exact=True).first
-                if await tab.count() and await tab.is_visible():
-                    await tab.click(force=True)
-                    await page.wait_for_timeout(700)
-                    douyin_logger.info(_msg("🧭", f"已切换封面页签「{tab_name}」"))
-                    break
-            except Exception:
-                pass
+        saw_confirm = False
+        any_uploaded = False
 
-        before = await self._cover_preview_state(cover_locator)
-        # 优先直接塞 file input（不弹系统资源管理器）；fileChooser 作兜底
-        uploaded = await self._upload_cover_via_inputs(cover_locator, thumb_path)
-        if not uploaded:
-            uploaded = await self._upload_cover_via_file_chooser(page, cover_locator, thumb_path)
-            if uploaded:
-                preview_ok = False
-                for _ in range(30):
-                    if self._cover_preview_ready(await self._cover_preview_state(cover_locator), before):
-                        preview_ok = True
-                        break
-                    await asyncio.sleep(0.4)
-                uploaded = preview_ok
-        else:
-            douyin_logger.info(_msg("🔍", "封面已通过 file input 注入（无系统文件框）"))
+        # 短视频主路径：先竖封面 3:4，再横封面 4:3（完成竖封面后常提示继续横封面）
+        if portrait_path:
+            if not await self._upload_cover_orientation(
+                page, cover_locator, portrait_path, "portrait"
+            ):
+                await self._dismiss_cover_modals(page)
+                return
+            any_uploaded = True
+            state = await self._handle_after_cover_finish(
+                page, cover_locator, prefer_landscape=bool(landscape_path)
+            )
+            if state == "confirmed":
+                saw_confirm = True
+            if landscape_path and state in ("landscape", "unknown", "confirmed"):
+                try:
+                    still_open = await page.locator(cover_locator_str).first.is_visible()
+                except Exception:
+                    still_open = False
+                if not still_open and state == "confirmed":
+                    douyin_logger.info(_msg("🧭", "竖封面已确认，重新打开弹窗设置横封面"))
+                    opened = await self._click_cover_entry(page)
+                    if opened:
+                        cover_locator = (
+                            await self._wait_cover_modal(page, timeout_ms=10000) or cover_locator
+                        )
+                if await self._upload_cover_orientation(
+                    page, cover_locator, landscape_path, "landscape"
+                ):
+                    state2 = await self._handle_after_cover_finish(
+                        page, cover_locator, prefer_landscape=False
+                    )
+                    if state2 == "confirmed":
+                        saw_confirm = True
+                    elif state2 == "landscape":
+                        await self._skip_landscape_cover_prompt(page)
+        elif landscape_path:
+            if not await self._upload_cover_orientation(
+                page, cover_locator, landscape_path, "landscape"
+            ):
+                await self._dismiss_cover_modals(page)
+                return
+            any_uploaded = True
+            state = await self._handle_after_cover_finish(
+                page, cover_locator, prefer_landscape=False
+            )
+            if state == "confirmed":
+                saw_confirm = True
 
-        if not uploaded:
-            douyin_logger.error(_msg("😵", "自定义封面未能进入预览区，放弃点完成以免空关弹窗"))
+        if not any_uploaded:
             await self._dismiss_cover_modals(page)
             return
 
-        douyin_logger.info(_msg("🖼️", f"{orientation}封面预览已就绪: {thumb_path}"))
-        await page.wait_for_timeout(800)
-
-        finish_btn = cover_locator.get_by_role("button", name="完成", exact=True).first
-        for _ in range(40):
-            try:
-                if await finish_btn.is_enabled():
-                    break
-            except Exception:
-                pass
-            await page.wait_for_timeout(500)
-
-        await finish_btn.click()
-        douyin_logger.info(_msg("🥳", "已点击封面完成"))
-
-        # 二次确认：「是否确认应用此封面？」——漏点确定会导致最终无封面
-        saw_confirm = False
-        for _ in range(25):
-            try:
-                confirm = page.get_by_text("是否确认应用此封面？", exact=False).first
-                if await confirm.count() and await confirm.is_visible():
-                    douyin_logger.info(_msg("🪟", "弹出确认框: 是否确认应用此封面？"))
-                    btn = page.get_by_role("button", name="确定", exact=True).first
-                    if not await btn.count():
-                        btn = page.locator("button").filter(has_text="确定").first
-                    await btn.click(force=True, timeout=5000)
-                    saw_confirm = True
-                    await page.wait_for_timeout(1000)
-                    break
-            except Exception:
-                pass
-            # 弹窗已关则无需确认
-            try:
-                if await page.locator(cover_locator_str).count() == 0:
-                    break
-                visible_modal = page.locator("div.dy-creator-content-modal").first
-                if await visible_modal.count() and not await visible_modal.is_visible():
-                    break
-            except Exception:
-                break
-            await page.wait_for_timeout(400)
-
-        closed = False
-        for state in ("hidden", "detached"):
-            try:
-                await page.locator(cover_locator_str).first.wait_for(state=state, timeout=10000)
-                closed = True
-                break
-            except Exception:
-                continue
-        if not closed:
-            # 再试一次确定，避免强删 DOM 把未确认封面冲掉
-            try:
-                btn = page.get_by_role("button", name="确定", exact=True).first
-                if await btn.count() and await btn.is_visible():
-                    await btn.click(force=True, timeout=3000)
-                    saw_confirm = True
-                    await page.wait_for_timeout(800)
-                    await page.locator(cover_locator_str).first.wait_for(state="hidden", timeout=5000)
-                    closed = True
-            except Exception:
-                pass
-        if not closed:
-            # 最后才 Escape（不要 DOM remove，否则封面确认会被吞掉）
-            try:
-                await page.keyboard.press("Escape")
-                await page.wait_for_timeout(500)
-            except Exception:
-                pass
-            douyin_logger.warning(
-                _msg("⚠️", "封面弹窗未正常关闭；若未点到「确定」，自定义封面可能未生效")
-            )
+        await self._close_cover_modal(page, saw_confirm=saw_confirm)
 
         await page.wait_for_timeout(800)
         if await self._verify_cover_on_publish_page(page):
