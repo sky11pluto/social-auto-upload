@@ -878,9 +878,12 @@ class DouYinBaseUploader(BaseVideoUploader):
             except Exception:
                 await page.keyboard.insert_text(query)
         douyin_logger.info(_msg("⭐", f"已填入星图搜索词（{len(query)} 字符）"))
-        # 等搜索结果渲染（接口慢时原先 1.5s 不够）
-        await asyncio.sleep(2.0)
-        for _ in range(30):
+        # 等搜索结果渲染（接口慢时不再死等；最多 1s+5s 轮询）
+        # 命中后立即跳出进入 radio card 匹配；未命中也不阻塞，_select_xingtu_via_radio_card 内部
+        # 仍会按弹窗内任务卡二次匹配（方案C 兜底）
+        await asyncio.sleep(1.0)
+        search_hit = False
+        for _ in range(10):
             hit = await page.evaluate(
                 """(qid) => {
                   const t = document.body ? document.body.innerText : '';
@@ -889,8 +892,12 @@ class DouYinBaseUploader(BaseVideoUploader):
                 query,
             )
             if hit:
+                search_hit = True
                 break
-            await asyncio.sleep(0.35)
+            await asyncio.sleep(0.5)
+        douyin_logger.info(
+            _msg("⭐", f"星图搜索词检测完成 hit={search_hit}")
+        )
 
         clicked = await self._select_xingtu_result(page, query)
         if not clicked:
@@ -1035,13 +1042,14 @@ class DouYinBaseUploader(BaseVideoUploader):
             return False
 
         cards = modal.locator('[class*="card-container"]')
-        for _ in range(40):
+        # 等弹窗内出现任务卡片（最多 20*0.4s=8s；典型 1-2s 内即可命中）
+        for _ in range(20):
             try:
                 if await cards.count() > 0:
                     break
             except Exception:
                 pass
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(0.4)
 
         n = await cards.count()
         douyin_logger.info(_msg("⭐", f"[方案A-radio] 弹窗内任务卡片数={n}"))
@@ -1088,7 +1096,8 @@ class DouYinBaseUploader(BaseVideoUploader):
         if not await option.count():
             option = option_roots.filter(has_text=tail).first
 
-        for _ in range(16):
+        # 等下拉项可见（最多 8*0.5s=4s）
+        for _ in range(8):
             try:
                 if await option.count() and await option.is_visible():
                     break
@@ -1101,7 +1110,7 @@ class DouYinBaseUploader(BaseVideoUploader):
                     break
             except Exception:
                 pass
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(0.5)
 
         try:
             if await option.count() and await option.is_visible():
@@ -1394,6 +1403,8 @@ class DouYinVideo(DouYinBaseUploader):
         debug: bool = DEBUG_MODE,
         headless: bool = LOCAL_CHROME_HEADLESS,
         xingtu_task_id: str | None = None,
+        collection_name: str | None = None,
+        collection_id: str | None = None,
     ):
         super().__init__(
             publish_date=publish_date,
@@ -1411,6 +1422,135 @@ class DouYinVideo(DouYinBaseUploader):
         self.productTitle = productTitle
         self.desc = desc or ""
         self.xingtu_task_id = (xingtu_task_id or "").strip()
+        # 合集配置：将视频发布到指定的抖音合集中
+        self.collection_name = (collection_name or "").strip()
+        self.collection_id = (collection_id or "").strip()
+
+    async def _select_douyin_collection(self, page: Page) -> bool:
+        """
+        选择抖音合集。
+        根据你提供的三张图：
+        - 选择前：semi-select-collection 是 .semi-select，内含「请选择合集」占位文本
+        - 选择中：弹出 semi-popover，其中是 semi-select-option-list + collection-option
+        - 选择后：semi-select-collection 内部变为 .selected-item-title / .selected-item-extra-text
+
+        返回 True 表示成功选择或保持已选；False 表示不可用。
+        """
+        if not self.collection_name:
+            return False
+
+        # 1) 定位合集下拉框
+        try:
+            collection_select = page.locator(
+                "div.semi-select.semi-select-collection.semi-select-single"
+            ).first
+            await collection_select.wait_for(state="visible", timeout=8000)
+        except Exception as exc:
+            douyin_logger.warning(
+                _msg("⚠️", f"未找到合集下拉框（可能账号/页面未支持合集）: {exc}")
+            )
+            return False
+
+        # 2) 检查是否已经是目标合集（避免重复点击）
+        try:
+            current_text = (await collection_select.inner_text(timeout=2000)) or ""
+            if self.collection_name in current_text and "请选择合集" not in current_text:
+                douyin_logger.info(
+                    _msg("✅", f"合集已选: {self.collection_name}（跳过）")
+                )
+                return True
+        except Exception:
+            pass
+
+        # 3) 点击下拉框打开选择面板
+        try:
+            await collection_select.click(force=True)
+            await page.wait_for_timeout(600)
+        except Exception as exc:
+            douyin_logger.warning(_msg("⚠️", f"打开合集下拉框失败: {exc}"))
+            return False
+
+        # 4) 等待下拉面板出现（semi-popover 包裹 semi-select-option-list）
+        try:
+            await page.wait_for_selector(
+                ".semi-popover-content .semi-select-option-list",
+                state="visible",
+                timeout=8000,
+            )
+        except Exception as exc:
+            douyin_logger.warning(_msg("⚠️", f"合集选项列表未展开: {exc}"))
+            return False
+
+        # 5) 在下拉列表中查找目标合集（注意区分已选中的「已选择」伪元素）
+        try:
+            # 定位 collection-option（合集选项，带 collection-option 类）
+            options = page.locator(
+                ".semi-popover-content .semi-select-option-list .collection-option"
+            )
+            count = await options.count()
+            douyin_logger.info(
+                _msg("🔍", f"合集候选数量: {count}（目标: {self.collection_name}）")
+            )
+
+            target_idx = -1
+            for i in range(count):
+                opt = options.nth(i)
+                text = (await opt.inner_text(timeout=2000)) or ""
+                # 已选中的项会带 .semi-select-option-selected，跳过
+                klass = (await opt.get_attribute("class") or "")
+                if "semi-select-option-selected" in klass:
+                    continue
+                if self.collection_name in text:
+                    target_idx = i
+                    break
+
+            if target_idx < 0:
+                # 候选中没有目标合集 → 抖音未自动创建同名合集
+                # 这里不做「新建合集」（抖音创作者中心需到「合集管理」手动创建）
+                douyin_logger.warning(
+                    _msg(
+                        "⚠️",
+                        f"未在候选中找到合集「{self.collection_name}」。"
+                        "请先在抖音创作者中心→合集管理中创建该合集。",
+                    )
+                )
+                # 关闭面板（点击页面其他位置或 ESC）
+                try:
+                    await page.keyboard.press("Escape")
+                    await page.wait_for_timeout(300)
+                except Exception:
+                    pass
+                return False
+
+            await options.nth(target_idx).click(force=True)
+            await page.wait_for_timeout(600)
+        except Exception as exc:
+            douyin_logger.warning(_msg("⚠️", f"点击合集选项失败: {exc}"))
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+            return False
+
+        # 6) 校验：semi-select-collection 内部出现 selected-item-title 即视为成功
+        try:
+            await page.wait_for_selector(
+                "div.semi-select.semi-select-collection .selected-item-title",
+                state="visible",
+                timeout=5000,
+            )
+            selected_title = await page.locator(
+                "div.semi-select.semi-select-collection .selected-item-title"
+            ).first.inner_text(timeout=2000)
+            douyin_logger.success(
+                _msg("🥳", f"已选择合集: {selected_title}")
+            )
+            return True
+        except Exception as exc:
+            douyin_logger.warning(
+                _msg("⚠️", f"合集选择后未检测到选中态: {exc}")
+            )
+            return False
 
     async def validate_upload_args(self):
         await self.validate_base_args()
@@ -2160,6 +2300,24 @@ class DouYinVideo(DouYinBaseUploader):
                     pass
                 douyin_logger.error(_msg("😵", f"星图挂载失败，中止发布: {exc}"))
                 raise RuntimeError(f"星图任务挂载失败，已中止发布: {exc}") from exc
+
+        # 合集选择：若指定了合集名称，则在发布页中勾选对应合集
+        if self.collection_name:
+            douyin_logger.info(_msg("📚", f"小人开始选择合集: {self.collection_name}"))
+            try:
+                ok = await self._select_douyin_collection(page)
+                if ok:
+                    douyin_logger.info(_msg("🥳", f"合集已挂上: {self.collection_name}"))
+                else:
+                    # 找不到合集/账号不支持合集：仅警告，不中断发布
+                    douyin_logger.warning(
+                        _msg(
+                            "⚠️",
+                            f"未能选择合集「{self.collection_name}」，视频将按无合集方式发布",
+                        )
+                    )
+            except Exception as exc:
+                douyin_logger.warning(_msg("⚠️", f"合集选择异常（继续发布）: {exc}"))
 
         if self.productLink and self.productTitle:
             douyin_logger.info(_msg("🛒", "小人正在设置商品链接"))
