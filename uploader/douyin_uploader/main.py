@@ -161,6 +161,276 @@ async def _douyin_upload_page_ready(page: Page) -> bool:
     return await _douyin_upload_input_visible(page)
 
 
+# 抖音新版发布页 URL：离开该页面即视为发布成功（抖音改版后不一定跳到 content/manage，可能跳数据中心/首页）
+_DOUYIN_PUBLISH_PAGE_URL_PATTERNS = (
+    "/content/publish",   # version_1 发布页
+    "/content/post/video", # version_2 发布页
+    "/content/post/note",  # 图文发布页
+    "/content/upload",     # 上传页
+)
+
+
+def _douyin_left_publish_page(page: Page) -> bool:
+    """判断是否已离开发布/上传页（发布成功的宽松判定，兼容抖音改版跳数据中心/首页）"""
+    url = page.url or ""
+    for pattern in _DOUYIN_PUBLISH_PAGE_URL_PATTERNS:
+        if pattern in url:
+            return False
+    # 仍在 creator.douyin.com 且不匹配任何发布/上传页 → 已跳转（数据中心/内容管理皆算成功）
+    return "creator.douyin.com" in url
+
+
+async def _douyin_click_publish_button(page: Page) -> bool:
+    """点击「发布」按钮，多选择器兜底（2026-08 抖音改版 exact 匹配及 role=button 偶发失效）。
+
+    顺序：
+      1. get_by_role('button', name='发布')（非 exact，避免按钮里含图标/空格漏匹配）
+      2. CSS class 前缀：button 且含 primary-- 高亮（用户截图 button-dhIU2E primary--eCi0Y）
+      3. get_by_text('发布') 的父节点 click（role=button 丢失时兜底）
+    只要任意一种方式点过就返回 True（按钮不可见仍返回 False）。
+    """
+    # 1) 文案驱动（非 exact，兼容按钮内部含 <span>发布</span> 或前后空格）
+    try:
+        role_btn = page.get_by_role("button", name="发布")
+        if await role_btn.count():
+            for idx in range(await role_btn.count()):
+                b = role_btn.nth(idx)
+                if await b.is_visible() and not await b.is_disabled():
+                    try:
+                        await b.click(force=True, timeout=5000)
+                        return True
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    # 2) Class 前缀：改版后按钮 class = "button-xxxx primary--yyyy fixed-zzzz"
+    try:
+        class_btn = page.locator(
+            "button[class*='primary--'][class*='button-']:has-text('发布')"
+        ).first
+        if await class_btn.count() and await class_btn.is_visible():
+            try:
+                await class_btn.click(force=True, timeout=5000)
+                return True
+            except Exception:
+                pass
+            # DOM 事件兜底（React 合成事件拦截 click 时退回 JS）
+            try:
+                await class_btn.evaluate("el => el.click()")
+                return True
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 3) 纯文字兜底：按钮 role 未定义但有"发布"文案
+    #    ⚠️ 收紧匹配范围：必须限定在 button / [role=button] 内，且精确匹配文案="发布"
+    #    （旧版 get_by_text("发布", exact=False) 会误匹配"发布设置""定时发布""发布视频"标题等，
+    #     点到这些元素会跳到设置页/其他页面，表现为"没点发布就跳走了"）
+    try:
+        text_btn = page.locator(
+            "button:has-text('发布'), [role='button']:has-text('发布')"
+        )
+        cnt = await text_btn.count()
+        for idx in range(cnt):
+            b = text_btn.nth(idx)
+            if not (await b.is_visible()) or await b.is_disabled():
+                continue
+            # 排除文案含"设置/时间/定时/草稿/预览"等非主发布按钮
+            txt = (await b.text_content() or "").strip()
+            if any(kw in txt for kw in ("设置", "时间", "定时", "草稿", "预览", "规则", "须知")):
+                continue
+            # 文案必须以"发布"开头或就是"发布"（避免匹配"取消发布"等）
+            if txt == "发布" or txt.startswith("发布"):
+                try:
+                    await b.click(force=True, timeout=5000)
+                    return True
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    return False
+
+
+async def _douyin_set_self_declaration_entry(page: Page) -> bool:
+    """打开自主声明弹窗入口，新老 DOM 兜底 + debug 日志打印（2026-08-08 三改版）。
+
+    按用户最新 DOM 截图（入口位于发布页 DCFF > form-container 底部，上传前即可点击）：
+      <div id="DCFF">
+        <div class="form-container-MBtobk new-layout">
+          ...
+          <section class="wrapper-ML2dHB">
+            <div class="labelWrapper-p6oS_Jm"/>
+            <div class="controlWrapper-Kt_9Km">
+              <div class="selectBox-buZkRi">                 ← 驼峰 selectBox
+                <div class="selectText-ESsMPZ">请选择自主声明</div>
+                <span class="chevron-ewXR1"/>
+              </div>
+            </div>
+          </section>
+        </div>
+      </div>
+    点击成功返回 True；每级失败均打 DEBUG 日志，便于下次定位"到底卡在哪一步"。
+    """
+    _DEBUG = True  # 临时开关，若日志太啰嗦改 False
+
+    async def _click_with_log(loc, *, tag: str) -> bool:
+        try:
+            if await loc.count() == 0:
+                _DEBUG and douyin_logger.debug(f"[声明入口-{tag}] count=0 未命中")
+                return False
+            if not await loc.is_visible():
+                # 滚到可见（该区域在发布页底部，不滚动会 pointer-events 拦截）
+                try:
+                    await loc.scroll_into_view_if_needed(timeout=2000)
+                except Exception:
+                    pass
+                if not await loc.is_visible():
+                    _DEBUG and douyin_logger.debug(f"[声明入口-{tag}] 命中但不可见，尝试 force=True 强点")
+            try:
+                await loc.click(force=True, timeout=4000)
+            except Exception:
+                # Playwright click 被遮罩拦截 → 退回浏览器原生事件
+                await loc.evaluate("el => el.scrollIntoView({block:'center'}); el.click();")
+            _DEBUG and douyin_logger.info(f"[声明入口-{tag}] 点击成功")
+            return True
+        except Exception as exc:
+            _DEBUG and douyin_logger.debug(f"[声明入口-{tag}] 异常: {type(exc).__name__}: {exc}")
+            return False
+
+    # ======= 第 1 级：DCFF > form-container 区域内强锁定（最新 2026-08-08 改版） =======
+    # 按用户 DOM：#DCFF 是发布表单总容器，form-container-* 内的 section.wrapper-* 含自主声明
+    # 该方式可避开页面上其他「请选择自主声明」（如草稿箱里的假 DOM）
+    scope_selector = ",".join([
+        "#DCFF section[class*='wrapper-'] div[class*='controlWrapper-'] div[class*='selectBox-']:has-text('请选择自主声明')",
+        "[class*='form-container-'] section[class*='wrapper-'] div[class*='controlWrapper-'] div[class*='selectBox-']:has-text('请选择自主声明')",
+    ])
+    if await _click_with_log(page.locator(scope_selector).first, tag="1-DCFF/form-container>wrapper>controlWrapper>selectBox"):
+        return True
+
+    # ======= 第 2 级：不锁区域，但要求是 section.wrapper-* > .controlWrapper-* > .selectBox-* 三层结构 =======
+    if await _click_with_log(
+        page.locator(
+            "section[class*='wrapper-'] div[class*='controlWrapper-'] div[class*='selectBox-']:has-text('请选择自主声明')"
+        ).first,
+        tag="2-section.wrapper>controlWrapper>selectBox",
+    ):
+        return True
+
+    # ======= 第 3 级：.selectBox- 单级（section 名变化但控件 class 不变） =======
+    if await _click_with_log(
+        page.locator(
+            "div[class*='selectBox-']:has(> div[class*='selectText-']:has-text('请选择自主声明'))"
+        ).first,
+        tag="3-selectBox>selectText",
+    ):
+        return True
+
+    # ======= 第 4 级：旧 DOM（.select-box- 连字符） =======
+    if await _click_with_log(
+        page.locator("div[class*='select-box-']:has-text('请选择自主声明')").first,
+        tag="4-select-box-(legacy)",
+    ):
+        return True
+
+    # ======= 第 5 级：publish-mention-wrapper 相邻位置兜底（用户截图该 wrapper 在 section 上面） =======
+    if await _click_with_log(
+        page.locator(
+            "[class*='publish-mention-wrapper'] + * section[class*='wrapper-'] div[class*='selectBox-']:has-text('请选择自主声明'),"
+            " [class*='publish-mention-wrapper'] div[class*='selectBox-']:has-text('请选择自主声明')"
+        ).first,
+        tag="5-publish-mention-wrapper-adjacent",
+    ):
+        return True
+
+    # ======= 第 6 级：纯文字 + 向上 1 层 DOM =======
+    if await _click_with_log(
+        page.get_by_text("请选择自主声明").first,
+        tag="6-pure-text",
+    ):
+        return True
+
+    # ======= 第 7 级：JS evaluate 原生 querySelectorAll 兜底（防 CSS 选择器 Playwright 解析异常） =======
+    try:
+        clicked_js = await page.evaluate("""() => {
+            const list = document.querySelectorAll('section[class*="wrapper-"] div[class*="selectBox-"], div[class*="selectBox-"], div[class*="select-box-"]');
+            for (const el of list) {
+                if (el.textContent && el.textContent.includes('请选择自主声明')) {
+                    el.scrollIntoView({block:'center'});
+                    el.click();
+                    return true;
+                }
+            }
+            return false;
+        }""")
+        if clicked_js:
+            _DEBUG and douyin_logger.info("[声明入口-7-JS_evaluate] 点击成功")
+            return True
+    except Exception as exc:
+        _DEBUG and douyin_logger.debug(f"[声明入口-7-JS_evaluate] 异常: {exc}")
+
+    # 全部失败：打印候选 class
+    # ⚠️ 注意：「已选声明」后入口文案会变（如「内容由AI生成」而不是「请选择自主声明」），此时 7 级全失败是正常的，
+    # 上层调用应先通过 _douyin_has_self_declaration_pending() 判定是否真的未选。故默认打 DEBUG，不打 WARNING。
+    if _DEBUG:
+        try:
+            cand = await page.evaluate("""() => {
+                const pick = (sel, maxN=30) => Array.from(document.querySelectorAll(sel)).slice(0, maxN)
+                    .map(e => [e.className ? e.className.toString().slice(0,80) : '[no-class]', e.textContent ? e.textContent.slice(0,20).replace(/\\s+/g,' ') : '']);
+                return {
+                    sections: pick('section[class*="wrapper-"]'),
+                    selects: pick('div[class*="selectBox-"], div[class*="select-box-"]'),
+                    form: pick('[class*="form-container-"]', 5).map(x=>x[0]),
+                };
+            }""")
+            douyin_logger.debug(f"[声明入口-ALL] 7 级入口均未命中（若已选声明属正常），候选 class: {cand}")
+        except Exception:
+            pass
+    return False
+
+
+async def _douyin_has_self_declaration_pending(page: Page) -> bool:
+    """是否仍显示「请选择自主声明」（未选则发布按钮会被抖音拦截）。
+    与入口 helper 同步使用 「DCFF/form-container 区域内优先 + 新老双写法 + JS兜底」，避免口径不一致。
+    """
+    # 最宽松先快速判真：有"请选择自主声明"文字且匹配 select 容器
+    checkers = [
+        # DCFF + 三层结构强锁定
+        lambda p: p.locator(
+            "#DCFF section[class*='wrapper-'] div[class*='controlWrapper-'] div[class*='selectBox-']:has-text('请选择自主声明')"
+        ).count(),
+        # 三层结构
+        lambda p: p.locator(
+            "section[class*='wrapper-'] div[class*='controlWrapper-'] div[class*='selectBox-']:has-text('请选择自主声明')"
+        ).count(),
+        # selectBox- 驼峰
+        lambda p: p.locator("div[class*='selectBox-']:has(> div[class*='selectText-']:has-text('请选择自主声明'))").count(),
+        # select-box- 连字符
+        lambda p: p.locator("div[class*='select-box-']:has-text('请选择自主声明')").count(),
+        # 纯文字
+        lambda p: p.get_by_text("请选择自主声明").count(),
+    ]
+    for fn in checkers:
+        try:
+            if await fn(page) > 0:
+                return True
+        except Exception:
+            pass
+    # JS 兜底
+    try:
+        if await page.evaluate("""() => {
+            const list = document.querySelectorAll('section[class*="wrapper-"] div[class*="selectBox-"], div[class*="selectBox-"], div[class*="select-box-"]');
+            for (const el of list) { if (el.textContent && el.textContent.includes('请选择自主声明')) return true; }
+            return false;
+        }"""):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 async def cookie_auth(account_file):
     # 抖音无头会撞反爬墙→content/upload 跳登录→误判 cookie 失效（间歇性）。校验必须有头。
     # SPA 慢加载/瞬时跳转会导致单次快照误判，故每轮内轮询 + 轮间退避重试。
@@ -1268,56 +1538,145 @@ class DouYinBaseUploader(BaseVideoUploader):
         except Exception:
             pass
 
-    async def set_self_declaration(self, page: Page, declaration: str = "内容由AI生成") -> None:
-        """抖音「自主声明」：按页面单选项中文文案匹配（非 id），打开声明弹窗 → 选指定类型 → 确定。
+    async def set_self_declaration(
+        self, page: Page, declaration: str = "内容由AI生成", *, must_succeed: bool = True
+    ) -> None:
+        """抖音「自主声明」：打开弹窗 → 选指定类型 → 确定。
 
-        入口和弹窗都是异步渲染，等不到就记 warning 跳过、继续发布，绝不因此中断
-        （与小红书话题、视频号声明原创的容错策略保持一致）。
+        参数 must_succeed:
+          - True  (默认，上传完后调用/发布循环补调用)：未选声明抖音必拦截发布按钮，
+            任何异常都直接 raise RuntimeError 中断发布
+          - False (上传进行中/并行调用)：此时发布页 DCFF 底部可能还在懒加载渲染，
+            失败记 warning 即可，上传完后会再补一次（must_succeed=True）
+
+        标题兼容两版：
+          - 老版：「对作品内容添加声明」
+          - 2026-08-08 新版：「请选择声明类型（单选）」（用户截图 header: selectorHeader-jxI9fI）
         """
-        # 文案别名：抖音偶发空格/「为」写法差异
+        def _fail(msg: str) -> None:
+            if must_succeed:
+                raise RuntimeError(msg)
+            douyin_logger.warning(_msg("🧾", f"[并行尝试] 自主声明设置失败（上传完成后会再补一次）: {msg}"))
+
+        # ================= 前置判定：已选声明则直接 return，避免无意义 raise =================
+        # 优先调用 pending 检查（与调用方口径一致）
+        if not await _douyin_has_self_declaration_pending(page):
+            # 没显示「请选择自主声明」→ 要么已经选了，要么页面没有该配置。
+            # 尝试读取当前显示值打印到日志，便于上层确认。
+            try:
+                cur_val = await page.evaluate("""() => {
+                    const list = document.querySelectorAll('section[class*="wrapper-"] div[class*="selectBox-"] div[class*="selectText-"], div[class*="selectBox-"] div[class*="selectText-"], div[class*="select-box-"]');
+                    for (const el of list) {
+                        const t = (el.textContent || '').trim();
+                        if (t && t.length < 40 && !t.includes('请选择')) return t;
+                    }
+                    return null;
+                }""")
+            except Exception:
+                cur_val = None
+            if cur_val:
+                douyin_logger.info(
+                    _msg("🧾", f"自主声明已设置「{cur_val}」，跳过本次 set_self_declaration（must_succeed={must_succeed}）")
+                )
+            else:
+                douyin_logger.info(
+                    _msg("🧾", f"页面未显示待选声明入口，跳过设置（must_succeed={must_succeed}）")
+                )
+            return
+        # ===================================================================================
+
+        # 文案别名：抖音偶发空格/「为」写法差异 + 用户截图新选项「内容为个人观点或见解」
         declaration_aliases = [
             declaration,
             "内容由AI生成",
             "内容由 AI 生成",
             "内容为AI生成",
             "内容为 AI 生成",
+            "内容为个人观点或见解",
+            "内容为个人观点或见解（非事实）",
         ]
+        # 封面弹层未关时会拦截点击（pointer-events），先清掉
         try:
-            # 封面弹层未关时会拦截点击（pointer-events），先清掉
             await self._dismiss_cover_modals(page)
+        except Exception:
+            pass
+        # 滚到底部让 DCFF 底部的声明区渲染（2026-08 该区域是滚动懒加载）
+        try:
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
+            await page.wait_for_timeout(200)
+        except Exception:
+            pass
 
-            # 发布页底部「自主声明」行，未选时显示占位文案「请选择自主声明」
-            entry = page.get_by_text("请选择自主声明").first
-            await entry.wait_for(state="visible", timeout=6000)
-            await entry.click(force=True)
+        # 打开入口（7 级选择器兜底，含 2026-08-08 驼峰 selectBox- + DCFF 区域锁定）
+        opened = await _douyin_set_self_declaration_entry(page)
+        if not opened:
+            # 理论上前面 pending=true 保证了入口存在；但为了绝对安全，这里再判一次
+            _fail("未定位到自主声明入口（详情查看 DEBUG 日志 [声明入口-ALL] 7 级未命中候选 class）")
+            return
 
-            # 弹窗标题「对作品内容添加声明」
-            dialog = page.locator(".semi-modal-content").filter(has_text="对作品内容添加声明").first
-            await dialog.wait_for(state="visible", timeout=6000)
+        # 定位弹窗：兼容两版标题（只要有一版出现就算打开成功）
+        dialog = None
+        for title in ("请选择声明类型（单选）", "对作品内容添加声明"):
+            try:
+                d = page.locator(".semi-modal-content").filter(has_text=title).first
+                await d.wait_for(state="visible", timeout=4000)
+                dialog = d
+                douyin_logger.info(_msg("🧾", f"自主声明弹窗已打开（标题: {title}）"))
+                break
+            except Exception:
+                continue
+        if dialog is None:
+            # 标题都不匹配，但确实有打开过的 semi-modal，兜底用第一个可见弹窗
+            any_dialog = page.locator(".semi-modal-content").first
+            if await any_dialog.count() and await any_dialog.is_visible():
+                dialog = any_dialog
+                douyin_logger.warning(_msg("🧾", "自主声明弹窗标题未命中，退回第一个可见弹窗"))
+            else:
+                _fail("点击自主声明入口后未打开弹窗（两版标题均未出现）")
+                return
 
-            # 单选项：Semi 的文字是 .semi-radio-addon（常带 pointer-events:none，直接点会卡 30s 超时），
-            # 要点可交互的 .semi-radio 外层；找不到外层再退回 force 强制点文字。exact 避免误命中预览「作者声明：…」。
-            clicked = False
-            for text in declaration_aliases:
+        # 单选项：优先点可交互的 .semi-radio 外层，避免 pointer-events:none 的 inner/addon 卡超时
+        clicked = False
+        for text in declaration_aliases:
+            try:
                 option = dialog.locator(".semi-radio").filter(has_text=text).first
                 if await option.count():
                     await option.click(timeout=6000, force=True)
                     declaration = text
                     clicked = True
                     break
+            except Exception:
+                pass
+            try:
                 label = dialog.get_by_text(text, exact=True).first
                 if await label.count():
                     await label.click(timeout=6000, force=True)
                     declaration = text
                     clicked = True
                     break
-            if not clicked:
-                raise RuntimeError(f"未找到自主声明选项：{declaration_aliases[0]}")
-            await dialog.get_by_role("button", name="确定").click(timeout=6000)
+            except Exception:
+                pass
+        if not clicked:
+            # 没点到选项前先关弹窗，不然遮罩影响后续操作
+            try:
+                await dialog.get_by_text("取消", exact=True).first.click(force=True)
+            except Exception:
+                pass
+            _fail(f"未找到自主声明选项（已尝试 {declaration_aliases}），请检查页面是否有新增声明类型")
+            return
+
+        # 点确定 → 等待弹窗关闭
+        ok_btn = dialog.get_by_role("button", name="确定")
+        if not await ok_btn.count():
+            # 新版弹窗 footer 的确定按钮可能不是 role=button 精确，用文字兜底
+            ok_btn = dialog.get_by_text("确定", exact=True).first
+        await ok_btn.click(timeout=6000, force=True)
+        try:
             await dialog.wait_for(state="hidden", timeout=6000)
-            douyin_logger.info(_msg("🧾", f"自主声明已选择「{declaration}」"))
-        except Exception as exc:
-            douyin_logger.warning(_msg("🧾", f"自主声明设置失败，跳过该步骤继续发布：{exc}"))
+        except Exception:
+            # 个别场景弹窗关了就不拦发布；失败的话 pending 检查会在上层循环重试
+            douyin_logger.warning(_msg("🧾", "自主声明确定后未观察到弹窗关闭，继续发布流程"))
+        douyin_logger.info(_msg("🧾", f"自主声明已选择「{declaration}」（must_succeed={must_succeed}）"))
 
     async def select_bgm(self, page: Page, bgm_name: str) -> bool:
         """为图文发布选择 BGM：可选增强功能，搜索无结果或异常均跳过不中断发布。"""
@@ -2246,7 +2605,10 @@ class DouYinVideo(DouYinBaseUploader):
         douyin_logger.info(_msg("📤", "已定位上传控件，开始写入视频文件"))
         await upload_input.set_input_files(self.file_path)
 
+        wait_round = 0
         while True:
+            wait_round += 1
+            # 抖音改版后上传完可能不自动跳 publish 页，先直接点上传页里的「发布」/「下一步」按钮
             try:
                 await page.wait_for_url(
                     "https://creator.douyin.com/creator-micro/content/publish?enter_from=publish_page",
@@ -2263,13 +2625,38 @@ class DouYinVideo(DouYinBaseUploader):
                     douyin_logger.info(_msg("🥳", "已经进入 version_2 发布页面"))
                     break
                 except Exception:
-                    douyin_logger.debug(_msg("🧍", "还没进到视频发布页面，小人继续等一会"))
+                    # 主动兜底：若已离开发布/上传页（跳首页/数据中心），直接报错中止，避免死等
+                    if _douyin_left_publish_page(page):
+                        raise RuntimeError(
+                            f"文件写入后未跳发布页，却跳转到了 {page.url}（可能抖音改版：上传完成后需手动点「发布」/「下一步」？）"
+                        )
+                    # 每 10s 记录一次 INFO，避免日志全是 debug
+                    if wait_round % 20 == 0:
+                        douyin_logger.info(
+                            _msg("⏳", f"等待跳转到视频发布页…（已等 {wait_round*0.5}s，当前URL: {page.url}）")
+                        )
+                    else:
+                        douyin_logger.debug(_msg("🧍", "还没进到视频发布页面，小人继续等一会"))
                     await asyncio.sleep(0.5)
 
         await asyncio.sleep(1)
         douyin_logger.info(_msg("✍️", "小人开始填标题、描述和话题"))
         await self.fill_title_and_description(page, self.title, self.desc or self.title, self.tags)
         douyin_logger.info(_msg("🏷️", f"小人一共贴了 {len(self.tags)} 个话题"))
+
+        # ⚡ 前移自主声明设置：填完标题/话题就立即尝试（与视频上传并行，不等待上传完成）
+        # 根据用户 DOM 截图：发布页 DCFF > form-container 底部的「自主声明」区在文件写入后即可点击，
+        # 无需等上传完；同时发布页 DCFF 是滚动加载的，这里会先 scroll 到底部让元素渲染。
+        if await _douyin_has_self_declaration_pending(page):
+            try:
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
+                await page.wait_for_timeout(300)
+            except Exception:
+                pass
+            douyin_logger.info(_msg("🧾", "并行设置自主声明（上传进行中同步执行，不等传完）"))
+            await self.set_self_declaration(page, must_succeed=False)  # 早期失败只记 warning，上传完后再补一次
+        else:
+            douyin_logger.info(_msg("🧾", "自主声明已设置/无需设置（未检测到「请选择自主声明」占位）"))
 
         # 必须等视频传完再挂星图/设封面：传完前「选择封面」常不可用，星图弹层失败还会遮挡封面
         while True:
@@ -2332,7 +2719,13 @@ class DouYinVideo(DouYinBaseUploader):
             pass
         await self.set_thumbnail(page)
 
-        await self.set_self_declaration(page)
+        # 上传完后的补调用：只有当 pending=true（仍显示「请选择自主声明」）才设置；
+        # 之前并行尝试已成功时此处直接跳过，避免入口 helper 因未命中旧文案报错中断 → 发布按钮永远走不到
+        if await _douyin_has_self_declaration_pending(page):
+            douyin_logger.info(_msg("🧾", "并行尝试未完成，上传完后补设自主声明"))
+            await self.set_self_declaration(page)  # must_succeed=True（默认）必选
+        else:
+            douyin_logger.info(_msg("🧾", "自主声明已在并行阶段完成，无需重复设置（跳过补调）"))
 
         third_part_element = '[class^="info"] > [class^="first-part"] div div.semi-switch'
         if await page.locator(third_part_element).count():
@@ -2344,24 +2737,44 @@ class DouYinVideo(DouYinBaseUploader):
 
         for publish_try in range(120):
             try:
-                # 移除会拦截发布按钮点击的新手引导/话题下拉/封面遮罩
+                # 记录点击前 URL，便于事后排查"未点发布就跳转"
+                url_before = page.url
+                # 移除会拦截发布按钮点击的新手引导/封面遮罩
+                # ⚠️ 不再 remove [class*="mention-wrapper"]：该选择器太宽泛，会误删话题输入区/
+                #    发布设置区相关 DOM，破坏 React 组件状态 → 可能触发页面异常跳转
                 await self._dismiss_cover_modals(page)
                 await page.evaluate(
-                    "() => { document.querySelectorAll('.shepherd-element, .shepherd-modal-overlay-container, [class*=\"mention-wrapper\"]').forEach(e => e.remove()); }"
+                    "() => { document.querySelectorAll('.shepherd-element, .shepherd-modal-overlay-container').forEach(e => e.remove()); }"
                 )
-                # 自主声明未选时抖音会拦发布：补一次（已选则入口文案变化，函数内会快速跳过/失败）
-                if await page.get_by_text("请选择自主声明").count():
+                # 自主声明未选时抖音会拦发布：补一次（已选则函数内会快速跳过）
+                if await _douyin_has_self_declaration_pending(page):
                     await self.set_self_declaration(page)
-                publish_button = page.get_by_role("button", name="发布", exact=True)
-                if await publish_button.count():
-                    await publish_button.click(force=True)
-                await page.wait_for_url(
-                    "https://creator.douyin.com/creator-micro/content/manage**",
-                    timeout=3000,
+                # 点发布按钮：多选择器兜底（2026-08 抖音改版 exact=True 偶发失效）
+                clicked = await _douyin_click_publish_button(page)
+                if clicked:
+                    douyin_logger.info(_msg("👆", f"已点击发布按钮（第{publish_try+1}次），点击前URL: {url_before}"))
+                elif publish_try % 10 == 9:
+                    douyin_logger.warning(
+                        _msg("😵", f"未定位到「发布」按钮（第{publish_try+1}次重试），继续等待页面加载…")
+                    )
+                # 发布成功判断：离开发布/上传页（抖音改版后不一定跳到 content/manage，
+                # 可能跳数据中心/创作者首页，只要 URL 不是发布页即算成功）
+                for _wait in range(4):  # 点后最多等 3*4=12s 确认跳转
+                    if _douyin_left_publish_page(page):
+                        break
+                    await asyncio.sleep(3)
+                if not _douyin_left_publish_page(page):
+                    raise RuntimeError(f"发布按钮点击后仍未离开发布页: {page.url}")
+                douyin_logger.success(
+                    _msg("🥳", f"视频发布成功，已跳转到：{page.url}")
                 )
-                douyin_logger.success(_msg("🥳", "视频发布成功，小人开心收工"))
                 break
-            except Exception:
+            except Exception as _exc:
+                # 关键：绑定异常并打印，否则失败原因完全不可见（之前静默吞掉导致日志只有"冲刺"无法定位）
+                if publish_try < 3 or publish_try % 5 == 0:
+                    douyin_logger.warning(
+                        _msg("😵", f"第{publish_try+1}次发布尝试异常: {type(_exc).__name__}: {_exc} | 当前URL: {page.url}")
+                    )
                 await self.handle_auto_video_cover(page)
                 if publish_try % 10 == 0:
                     douyin_logger.info(_msg("🏃", f"小人正在冲刺发布视频（{publish_try + 1}/120）"))
@@ -2369,7 +2782,7 @@ class DouYinVideo(DouYinBaseUploader):
                     await page.screenshot(full_page=True)
                 await asyncio.sleep(0.5)
         else:
-            raise RuntimeError("抖音发布超时：多次点击发布仍未进入作品管理页")
+            raise RuntimeError("抖音发布超时：多次点击发布仍未离开发布页（内容管理/数据中心皆未跳转）")
 
         await context.storage_state(path=self.account_file)
         douyin_logger.success(_msg("🥳", "cookie 更新完毕"))
@@ -2474,20 +2887,28 @@ class DouYinNote(DouYinBaseUploader):
         if self.publish_strategy == DOUYIN_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
             await self.set_schedule_time_douyin(page, self.publish_date)
 
-        while True:
+        for publish_try in range(120):
             try:
-                publish_button = page.get_by_role("button", name="发布", exact=True)
-                if await publish_button.count():
-                    await publish_button.click()
-                await page.wait_for_url(
-                    "**/creator-micro/content/manage?enter_from=publish**",
-                    timeout=3000,
+                # 点发布按钮：多选择器兜底（2026-08 抖音改版）
+                await _douyin_click_publish_button(page)
+                # 发布成功判断：离开发布/上传页（抖音改版后不一定跳到 content/manage）
+                for _wait in range(4):
+                    if _douyin_left_publish_page(page):
+                        break
+                    await asyncio.sleep(3)
+                if not _douyin_left_publish_page(page):
+                    raise RuntimeError(f"图文发布点击后仍未离开发布页: {page.url}")
+                douyin_logger.success(
+                    _msg("🥳", f"图文发布成功，已跳转到：{page.url}")
                 )
-                douyin_logger.success(_msg("🥳", "图文发布成功，小人开心收工"))
                 break
             except Exception:
-                douyin_logger.info(_msg("🏃", "小人正在冲刺发布图文"))
+                douyin_logger.info(
+                    _msg("🏃", f"小人正在冲刺发布图文（{publish_try + 1}/120）")
+                )
                 await asyncio.sleep(0.5)
+        else:
+            raise RuntimeError("图文发布超时：多次点击发布仍未离开发布页")
 
     async def upload(self, playwright: Playwright) -> None:
         douyin_logger.info(_msg("🧍", "小人先检查 cookie、图片和发布时间"))
