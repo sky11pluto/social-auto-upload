@@ -180,52 +180,125 @@ def _douyin_left_publish_page(page: Page) -> bool:
     return "creator.douyin.com" in url
 
 
+async def _douyin_click_next_step_button(page: Page) -> bool:
+    """点击「下一步」按钮：抖音两阶段发布页（填写信息 → 下一步 → 确认/发布），需先进入最终发布页。"""
+    selectors = [
+        "button:has-text('下一步')",
+        "[role='button']:has-text('下一步')",
+        "button:has-text('继续')",
+    ]
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            cnt = await loc.count()
+            for idx in range(cnt):
+                b = loc.nth(idx)
+                if not (await b.is_visible()) or await b.is_disabled():
+                    continue
+                txt = (await b.text_content() or "").strip()
+                if txt not in ("下一步", "继续"):
+                    continue
+                try:
+                    await b.click(force=True, timeout=5000)
+                    return True
+                except Exception:
+                    try:
+                        await b.evaluate("el => el.click()")
+                        return True
+                    except Exception:
+                        pass
+        except Exception:
+            continue
+    return False
+
+
 async def _douyin_click_publish_button(page: Page) -> bool:
     """点击「发布」按钮，多选择器兜底（2026-08 抖音改版 exact 匹配及 role=button 偶发失效）。
 
-    顺序：
-      1. get_by_role('button', name='发布')（非 exact，避免按钮里含图标/空格漏匹配）
-      2. CSS class 前缀：button 且含 primary-- 高亮（用户截图 button-dhIU2E primary--eCi0Y）
-      3. get_by_text('发布') 的父节点 click（role=button 丢失时兜底）
+    顺序（优先级从高到低，每条都先排除非主发布文案）：
+      1. footer / fixed-bottom 区域内的 primary 按钮（最可靠：发布按钮永远在发布页底部固定栏）
+      2. get_by_role('button', name='发布') + 文案精确 == "发布"
+      3. CSS class 前缀：button 且含 primary-- 高亮，文案精确 == "发布"
+      4. 纯文字兜底：必须限定在 button / [role=button] 内，且文案精确 == "发布"
     只要任意一种方式点过就返回 True（按钮不可见仍返回 False）。
+
+    ⚠️ 严禁使用 startswith/模糊匹配：必须 txt == "发布"，避免点到"发布设置""发布视频""取消发布"
+       等非主按钮，它们一旦被点击会跳走，SDK 会误判为发布成功，却实际未发布。
     """
-    # 1) 文案驱动（非 exact，兼容按钮内部含 <span>发布</span> 或前后空格）
+
+    def _txt_ok(txt: str) -> bool:
+        s = (txt or "").strip()
+        if not s:
+            return False
+        if any(kw in s for kw in ("设置", "时间", "定时", "草稿", "预览", "规则", "须知", "商品", "合集", "取消")):
+            return False
+        return s == "发布"
+
+    async def _try_click(b) -> bool:
+        try:
+            await b.click(force=True, timeout=5000)
+            return True
+        except Exception:
+            pass
+        try:
+            await b.evaluate("el => el.click()")
+            return True
+        except Exception:
+            return False
+
+    # 1) 底部固定区域优先（发布按钮永远位于 fixed-bottom / footer）
+    for container_sel in (
+        "[class*='footer'] button[class*='primary--']",
+        "[class*='fixed-bottom'] button[class*='primary--']",
+        "form button[class*='primary--']:last-of-type",
+    ):
+        try:
+            footer_btn = page.locator(f"{container_sel}:has-text('发布')")
+            cnt = await footer_btn.count()
+            for idx in range(cnt):
+                b = footer_btn.nth(idx)
+                if not (await b.is_visible()) or await b.is_disabled():
+                    continue
+                if not _txt_ok(await b.text_content() or ""):
+                    continue
+                if await _try_click(b):
+                    return True
+        except Exception:
+            continue
+
+    # 2) 文案驱动（role=button + name=发布），文案必须精确 == 发布
     try:
         role_btn = page.get_by_role("button", name="发布")
         if await role_btn.count():
             for idx in range(await role_btn.count()):
                 b = role_btn.nth(idx)
-                if await b.is_visible() and not await b.is_disabled():
-                    try:
-                        await b.click(force=True, timeout=5000)
-                        return True
-                    except Exception:
-                        pass
+                if not (await b.is_visible()) or await b.is_disabled():
+                    continue
+                if not _txt_ok(await b.text_content() or ""):
+                    continue
+                if await _try_click(b):
+                    return True
     except Exception:
         pass
 
-    # 2) Class 前缀：改版后按钮 class = "button-xxxx primary--yyyy fixed-zzzz"
+    # 3) Class 前缀：改版后按钮 class = "button-xxxx primary--yyyy fixed-zzzz"
     try:
         class_btn = page.locator(
             "button[class*='primary--'][class*='button-']:has-text('发布')"
-        ).first
-        if await class_btn.count() and await class_btn.is_visible():
-            try:
-                await class_btn.click(force=True, timeout=5000)
+        )
+        cnt = await class_btn.count()
+        for idx in range(cnt):
+            b = class_btn.nth(idx) if cnt > 1 else class_btn
+            if not (await b.is_visible()) or await b.is_disabled():
+                continue
+            if not _txt_ok(await b.text_content() or ""):
+                continue
+            if await _try_click(b):
                 return True
-            except Exception:
-                pass
-            # DOM 事件兜底（React 合成事件拦截 click 时退回 JS）
-            try:
-                await class_btn.evaluate("el => el.click()")
-                return True
-            except Exception:
-                pass
     except Exception:
         pass
 
-    # 3) 纯文字兜底：按钮 role 未定义但有"发布"文案
-    #    ⚠️ 收紧匹配范围：必须限定在 button / [role=button] 内，且精确匹配文案="发布"
+    # 4) 纯文字兜底：必须限定在 button / [role=button] 内，且文案精确 == "发布"
     #    （旧版 get_by_text("发布", exact=False) 会误匹配"发布设置""定时发布""发布视频"标题等，
     #     点到这些元素会跳到设置页/其他页面，表现为"没点发布就跳走了"）
     try:
@@ -237,17 +310,10 @@ async def _douyin_click_publish_button(page: Page) -> bool:
             b = text_btn.nth(idx)
             if not (await b.is_visible()) or await b.is_disabled():
                 continue
-            # 排除文案含"设置/时间/定时/草稿/预览"等非主发布按钮
-            txt = (await b.text_content() or "").strip()
-            if any(kw in txt for kw in ("设置", "时间", "定时", "草稿", "预览", "规则", "须知")):
+            if not _txt_ok(await b.text_content() or ""):
                 continue
-            # 文案必须以"发布"开头或就是"发布"（避免匹配"取消发布"等）
-            if txt == "发布" or txt.startswith("发布"):
-                try:
-                    await b.click(force=True, timeout=5000)
-                    return True
-                except Exception:
-                    pass
+            if await _try_click(b):
+                return True
     except Exception:
         pass
 
@@ -2735,10 +2801,20 @@ class DouYinVideo(DouYinBaseUploader):
         if self.publish_strategy == DOUYIN_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
             await self.set_schedule_time_douyin(page, self.publish_date)
 
+        publish_clicked = False  # ⚠️ 状态机：必须点过「发布」按钮后的跳离才算发布成功
         for publish_try in range(120):
             try:
                 # 记录点击前 URL，便于事后排查"未点发布就跳转"
                 url_before = page.url
+
+                # 先判：如果本轮之前还没点过发布，但 URL 已经离开发布页 → 一定是被误点了其他元素跳走，
+                # 直接报错中止，不得再重试（继续重试只会误判成功或死等）
+                if not publish_clicked and _douyin_left_publish_page(page):
+                    raise RuntimeError(
+                        f"未点击「发布」按钮却已跳离发布页：当前 URL={page.url}（"
+                        f"可能误点了「发布设置/取消发布/发布视频」等非主发布按钮，已中止避免假成功）"
+                    )
+
                 # 移除会拦截发布按钮点击的新手引导/封面遮罩
                 # ⚠️ 不再 remove [class*="mention-wrapper"]：该选择器太宽泛，会误删话题输入区/
                 #    发布设置区相关 DOM，破坏 React 组件状态 → 可能触发页面异常跳转
@@ -2749,27 +2825,48 @@ class DouYinVideo(DouYinBaseUploader):
                 # 自主声明未选时抖音会拦发布：补一次（已选则函数内会快速跳过）
                 if await _douyin_has_self_declaration_pending(page):
                     await self.set_self_declaration(page)
+
+                # 点「下一步」优先：抖音两阶段发布页（填写信息 → 下一步 → 确认/发布），
+                # 如果页面有「下一步」则先点它，进入最终发布页后再等「发布」按钮出现
+                if not publish_clicked and (await _douyin_click_next_step_button(page)):
+                    douyin_logger.info(
+                        _msg("⏭️", f"检测到两阶段发布页，已点击「下一步」进入最终发布页（第{publish_try+1}次尝试）")
+                    )
+                    await asyncio.sleep(2)
+                    continue
+
                 # 点发布按钮：多选择器兜底（2026-08 抖音改版 exact=True 偶发失效）
                 clicked = await _douyin_click_publish_button(page)
                 if clicked:
+                    publish_clicked = True  # ★ 状态机翻转：此后的跳离才算发布成功
                     douyin_logger.info(_msg("👆", f"已点击发布按钮（第{publish_try+1}次），点击前URL: {url_before}"))
                 elif publish_try % 10 == 9:
                     douyin_logger.warning(
                         _msg("😵", f"未定位到「发布」按钮（第{publish_try+1}次重试），继续等待页面加载…")
                     )
-                # 发布成功判断：离开发布/上传页（抖音改版后不一定跳到 content/manage，
-                # 可能跳数据中心/创作者首页，只要 URL 不是发布页即算成功）
-                for _wait in range(4):  # 点后最多等 3*4=12s 确认跳转
-                    if _douyin_left_publish_page(page):
-                        break
-                    await asyncio.sleep(3)
-                if not _douyin_left_publish_page(page):
-                    raise RuntimeError(f"发布按钮点击后仍未离开发布页: {page.url}")
-                douyin_logger.success(
-                    _msg("🥳", f"视频发布成功，已跳转到：{page.url}")
-                )
-                break
+
+                # 发布成功判断：**必须同时满足两个条件**
+                #   (a) publish_clicked == True（已经真的点过「发布」按钮）
+                #   (b) 离开发布/上传页（抖音改版后不一定跳到 content/manage，
+                #       可能跳数据中心/创作者首页，只要 URL 不是发布页即算成功）
+                if publish_clicked:
+                    for _wait in range(4):  # 点后最多等 3*4=12s 确认跳转
+                        if _douyin_left_publish_page(page):
+                            break
+                        await asyncio.sleep(3)
+                    if not _douyin_left_publish_page(page):
+                        raise RuntimeError(f"发布按钮点击后仍未离开发布页: {page.url}")
+                    douyin_logger.success(
+                        _msg("🥳", f"视频发布成功，已跳转到：{page.url}")
+                    )
+                    break
+                else:
+                    # 没点到发布就不进入等待跳转，继续重试（避免没必要地 sleep 12s）
+                    await asyncio.sleep(1)
             except Exception as _exc:
+                # 如果是"未点发布就跳离"这种致命错误，直接抛出，不再重试
+                if "未点击「发布」按钮却已跳离发布页" in str(_exc):
+                    raise
                 # 关键：绑定异常并打印，否则失败原因完全不可见（之前静默吞掉导致日志只有"冲刺"无法定位）
                 if publish_try < 3 or publish_try % 5 == 0:
                     douyin_logger.warning(
