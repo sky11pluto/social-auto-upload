@@ -213,30 +213,51 @@ async def _douyin_click_next_step_button(page: Page) -> bool:
 
 
 async def _douyin_click_publish_button(page: Page) -> bool:
-    """点击「发布」按钮，多选择器兜底（2026-08 抖音改版 exact 匹配及 role=button 偶发失效）。
+    """点击底部主「发布」按钮，多选择器兜底（2026-08-13 新版 DOM）。
 
     顺序（优先级从高到低，每条都先排除非主发布文案）：
-      1. footer / fixed-bottom 区域内的 primary 按钮（最可靠：发布按钮永远在发布页底部固定栏）
-      2. get_by_role('button', name='发布') + 文案精确 == "发布"
-      3. CSS class 前缀：button 且含 primary-- 高亮，文案精确 == "发布"
-      4. 纯文字兜底：必须限定在 button / [role=button] 内，且文案精确 == "发布"
+      1. 新版确认栏：#popover-tip-container > button（文案「发布」，旁边是「暂存离开」）
+      2. [class*='content-confirm-container'] 内的 primary 按钮
+      3. footer / fixed-bottom 区域内的 primary 按钮（旧版）
+      4. get_by_role('button', name='发布', exact=True) + 文案精确 == "发布"
+      5. CSS class：button- + primary（兼容 primary--hash 与 primary-hash）
+      6. 纯文字兜底 + JS DOM click（popover 遮罩时 Playwright 可能点不到）
     只要任意一种方式点过就返回 True（按钮不可见仍返回 False）。
 
-    ⚠️ 严禁使用 startswith/模糊匹配：必须 txt == "发布"，避免点到"发布设置""发布视频""取消发布"
-       等非主按钮，它们一旦被点击会跳走，SDK 会误判为发布成功，却实际未发布。
+    ⚠️ 严禁使用 startswith/模糊匹配：必须 txt == "发布"，避免点到「发布设置」「发布视频」
+       「取消发布」「暂存离开」等，它们一旦被点击会跳走，表现为未点发布却已离开发布页。
     """
 
     def _txt_ok(txt: str) -> bool:
-        s = (txt or "").strip()
+        s = "".join((txt or "").split())
         if not s:
             return False
-        if any(kw in s for kw in ("设置", "时间", "定时", "草稿", "预览", "规则", "须知", "商品", "合集", "取消")):
+        if any(
+            kw in s
+            for kw in (
+                "设置", "时间", "定时", "草稿", "预览", "规则", "须知",
+                "商品", "合集", "取消", "暂存", "离开", "下一步",
+            )
+        ):
             return False
         return s == "发布"
 
+    async def _cls_ok(b) -> bool:
+        try:
+            cls = (await b.get_attribute("class") or "").lower()
+            if "cancel" in cls:
+                return False
+        except Exception:
+            pass
+        return True
+
     async def _try_click(b) -> bool:
         try:
-            await b.click(force=True, timeout=5000)
+            await b.scroll_into_view_if_needed()
+        except Exception:
+            pass
+        try:
+            await b.click(force=True, timeout=4000)
             return True
         except Exception:
             pass
@@ -246,74 +267,121 @@ async def _douyin_click_publish_button(page: Page) -> bool:
         except Exception:
             return False
 
-    # 1) 底部固定区域优先（发布按钮永远位于 fixed-bottom / footer）
-    for container_sel in (
-        "[class*='footer'] button[class*='primary--']",
-        "[class*='fixed-bottom'] button[class*='primary--']",
-        "form button[class*='primary--']:last-of-type",
-    ):
+    async def _try_locators(locator, desc: str) -> bool:
         try:
-            footer_btn = page.locator(f"{container_sel}:has-text('发布')")
-            cnt = await footer_btn.count()
-            for idx in range(cnt):
-                b = footer_btn.nth(idx)
-                if not (await b.is_visible()) or await b.is_disabled():
-                    continue
-                if not _txt_ok(await b.text_content() or ""):
-                    continue
-                if await _try_click(b):
-                    return True
+            cnt = await locator.count()
         except Exception:
-            continue
-
-    # 2) 文案驱动（role=button + name=发布），文案必须精确 == 发布
-    try:
-        role_btn = page.get_by_role("button", name="发布")
-        if await role_btn.count():
-            for idx in range(await role_btn.count()):
-                b = role_btn.nth(idx)
+            return False
+        for idx in range(cnt):
+            b = locator.nth(idx)
+            try:
                 if not (await b.is_visible()) or await b.is_disabled():
+                    continue
+                if not await _cls_ok(b):
                     continue
                 if not _txt_ok(await b.text_content() or ""):
                     continue
                 if await _try_click(b):
+                    douyin_logger.info(_msg("👆", f"命中发布按钮选择器: {desc}"))
                     return True
+            except Exception:
+                continue
+        return False
+
+    # 底部确认栏可能是滚动懒加载，先滚到底再找按钮
+    try:
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
     except Exception:
         pass
 
-    # 3) Class 前缀：改版后按钮 class = "button-xxxx primary--yyyy fixed-zzzz"
+    # 1) 2026-08-13 新版：#popover-tip-container > button.button-*.primary-*.fixed-*
+    for sel, desc in (
+        ("#popover-tip-container > button", "#popover-tip-container"),
+        (
+            "[class*='content-confirm-container'] button[class*='primary']",
+            "content-confirm-container primary",
+        ),
+        (
+            "[class*='content-confirm-container'] button[class*='button-']",
+            "content-confirm-container button",
+        ),
+        (
+            "[class*='new-layout'] button[class*='primary'][class*='fixed-']",
+            "new-layout primary fixed",
+        ),
+    ):
+        if await _try_locators(page.locator(sel), desc):
+            return True
+
+    # 2) 旧版底部固定区域（primary- 可同时匹配 primary--hash 与 primary-hash）
+    for sel, desc in (
+        ("[class*='footer'] button[class*='primary']", "footer primary"),
+        ("[class*='fixed-bottom'] button[class*='primary']", "fixed-bottom primary"),
+        ("form button[class*='primary']:last-of-type", "form last primary"),
+    ):
+        if await _try_locators(page.locator(f"{sel}:has-text('发布')"), desc):
+            return True
+
+    # 3) 文案驱动，exact=True 避免匹配「发布设置/发布视频」
     try:
-        class_btn = page.locator(
-            "button[class*='primary--'][class*='button-']:has-text('发布')"
-        )
-        cnt = await class_btn.count()
-        for idx in range(cnt):
-            b = class_btn.nth(idx) if cnt > 1 else class_btn
-            if not (await b.is_visible()) or await b.is_disabled():
-                continue
-            if not _txt_ok(await b.text_content() or ""):
-                continue
-            if await _try_click(b):
-                return True
+        if await _try_locators(
+            page.get_by_role("button", name="发布", exact=True),
+            "role=button exact",
+        ):
+            return True
     except Exception:
         pass
 
-    # 4) 纯文字兜底：必须限定在 button / [role=button] 内，且文案精确 == "发布"
-    #    （旧版 get_by_text("发布", exact=False) 会误匹配"发布设置""定时发布""发布视频"标题等，
-    #     点到这些元素会跳到设置页/其他页面，表现为"没点发布就跳走了"）
+    # 4) Class 前缀：button-xxxx primary-yyyy / primary--yyyy
+    if await _try_locators(
+        page.locator("button[class*='primary'][class*='button-']:has-text('发布')"),
+        "button.primary.button-",
+    ):
+        return True
+
+    # 5) 纯文字兜底：必须限定在 button / [role=button] 内，且文案精确 == 发布
+    if await _try_locators(
+        page.locator("button:has-text('发布'), [role='button']:has-text('发布')"),
+        "button has-text 发布",
+    ):
+        return True
+
+    # 6) JS 兜底：#popover-tip-container 上的 popover/semi-portal 可能挡住 Playwright 点击
     try:
-        text_btn = page.locator(
-            "button:has-text('发布'), [role='button']:has-text('发布')"
+        clicked_js = await page.evaluate(
+            """() => {
+                const textOk = (el) => {
+                    const s = (el.innerText || el.textContent || '').replace(/\\s+/g, '');
+                    return s === '发布';
+                };
+                const reject = (el) => {
+                    const cls = (el.className || '').toString().toLowerCase();
+                    const s = (el.innerText || el.textContent || '');
+                    if (cls.includes('cancel')) return true;
+                    if (s.includes('暂存') || s.includes('离开') || s.includes('设置') || s.includes('取消')) return true;
+                    return false;
+                };
+                const list = [];
+                const pop = document.querySelector('#popover-tip-container button');
+                if (pop) list.push(pop);
+                document.querySelectorAll('[class*="content-confirm-container"] button').forEach((b) => list.push(b));
+                document.querySelectorAll('button[class*="primary"]').forEach((b) => list.push(b));
+                const seen = new Set();
+                for (const el of list) {
+                    if (!el || seen.has(el) || reject(el) || !textOk(el) || el.disabled) continue;
+                    seen.add(el);
+                    const st = window.getComputedStyle(el);
+                    if (st.display === 'none' || st.visibility === 'hidden') continue;
+                    el.scrollIntoView({ block: 'center', inline: 'center' });
+                    el.click();
+                    return true;
+                }
+                return false;
+            }"""
         )
-        cnt = await text_btn.count()
-        for idx in range(cnt):
-            b = text_btn.nth(idx)
-            if not (await b.is_visible()) or await b.is_disabled():
-                continue
-            if not _txt_ok(await b.text_content() or ""):
-                continue
-            if await _try_click(b):
-                return True
+        if clicked_js:
+            douyin_logger.info(_msg("👆", "命中发布按钮选择器: JS DOM click"))
+            return True
     except Exception:
         pass
 
@@ -1026,7 +1094,19 @@ class DouYinBaseUploader(BaseVideoUploader):
             return False
 
     async def _dismiss_cover_modals(self, page: Page) -> None:
-        """强拆封面/内容弹层，避免挡住自主声明与发布按钮。"""
+        """强拆封面/内容弹层，避免挡住自主声明与发布按钮。
+
+        无封面弹层时不要按 Escape：新版发布页底部是「发布 / 暂存离开」，
+        Esc 会被当成暂存离开，直接跳到创作者首页。
+        """
+        modal_visible = False
+        try:
+            modal = page.locator("div.dy-creator-content-modal").first
+            modal_visible = bool(await modal.count()) and await modal.is_visible()
+        except Exception:
+            modal_visible = False
+        if not modal_visible:
+            return
         try:
             # 优先点确定/完成（确认应用封面）
             for name in ("确定", "完成"):
@@ -1582,7 +1662,19 @@ class DouYinBaseUploader(BaseVideoUploader):
             return False
 
     async def _dismiss_xingtu_overlays(self, page: Page) -> None:
-        """关闭星图选择残留层：只点取消/Esc，绝不点确定。"""
+        """关闭星图选择残留层：只点取消/Esc，绝不点确定。
+
+        无可见 semi-modal 时不要 Esc，更不要点击左上角坐标：
+        新版发布页 Esc / 点到 Logo 会触发「暂存离开」跳转创作者首页。
+        """
+        modal_visible = False
+        try:
+            modal = page.locator(".semi-modal-wrapper, div.semi-modal").first
+            modal_visible = bool(await modal.count()) and await modal.is_visible()
+        except Exception:
+            modal_visible = False
+        if not modal_visible:
+            return
         try:
             cancel = page.locator("div.semi-modal-footer button.semi-button-tertiary").filter(
                 has_text=re.compile(r"^取消$")
@@ -1598,11 +1690,6 @@ class DouYinBaseUploader(BaseVideoUploader):
                 await page.wait_for_timeout(250)
             except Exception:
                 break
-        try:
-            await page.mouse.click(40, 120)
-            await page.wait_for_timeout(200)
-        except Exception:
-            pass
 
     async def set_self_declaration(
         self, page: Page, declaration: str = "内容由AI生成", *, must_succeed: bool = True
@@ -2812,10 +2899,13 @@ class DouYinVideo(DouYinBaseUploader):
                 if not publish_clicked and _douyin_left_publish_page(page):
                     raise RuntimeError(
                         f"未点击「发布」按钮却已跳离发布页：当前 URL={page.url}（"
-                        f"可能误点了「发布设置/取消发布/发布视频」等非主发布按钮，已中止避免假成功）"
+                        f"可能误点了「暂存离开/发布设置/取消发布」或 Esc 触发暂存离开，已中止避免假成功）"
                     )
 
-                # 移除会拦截发布按钮点击的新手引导/封面遮罩
+                if publish_try == 0:
+                    douyin_logger.info(_msg("🏃", f"开始点击发布，当前URL: {url_before}"))
+
+                # 移除会拦截发布按钮点击的新手引导/封面遮罩（无封面弹层时不会按 Esc）
                 # ⚠️ 不再 remove [class*="mention-wrapper"]：该选择器太宽泛，会误删话题输入区/
                 #    发布设置区相关 DOM，破坏 React 组件状态 → 可能触发页面异常跳转
                 await self._dismiss_cover_modals(page)
