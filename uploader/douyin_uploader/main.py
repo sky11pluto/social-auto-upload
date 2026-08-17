@@ -123,6 +123,64 @@ async def _find_upload_file_input(page: Page):
     return page.locator("div[class^='container'] input[type='file']").first
 
 
+def _upload_video_button(page: Page):
+    """新版创作者中心拖拽区主按钮：文案「上传视频」（可能拆成两个文本节点）。"""
+    return page.get_by_role("button", name=re.compile(r"上传\s*视频"))
+
+
+async def _douyin_upload_button_visible(page: Page) -> bool:
+    try:
+        loc = _upload_video_button(page)
+        return bool(await loc.count()) and await loc.first.is_visible()
+    except Exception:
+        return False
+
+
+async def _set_douyin_upload_file(page: Page, file_path: str) -> None:
+    """优先点击可见「上传视频」走 file chooser；失败再回退 hidden input。"""
+    btn = _upload_video_button(page)
+    click_targets = [
+        btn.first,
+        page.locator('[class*="container-drag-btn"]').first,
+        page.locator("button.semi-button-primary").filter(has_text="上传视频").first,
+        page.get_by_text("点击上传 或直接将视频文件拖入此区域").first,
+    ]
+    for idx, target in enumerate(click_targets):
+        try:
+            if not await target.count():
+                continue
+            if not await target.is_visible():
+                continue
+            async with page.expect_file_chooser(timeout=8000) as fc_info:
+                await target.click(force=True)
+            chooser = await fc_info.value
+            await chooser.set_files(file_path)
+            douyin_logger.info(_msg("📤", f"已点击「上传视频」并写入文件（target#{idx}）"))
+            return
+        except Exception as exc:
+            douyin_logger.debug(_msg("🔍", f"上传按钮 fileChooser target#{idx} 失败: {exc}"))
+
+    upload_input = await _find_upload_file_input(page)
+    douyin_logger.info(_msg("📤", "未点到「上传视频」，回退写入 hidden file input"))
+    await upload_input.wait_for(state="attached", timeout=120000)
+    await upload_input.set_input_files(file_path)
+
+
+async def _try_click_upload_page_next(page: Page) -> bool:
+    """上传完成后若仍停在 upload 页，尝试点「下一步/发布」。"""
+    names = ("下一步", "进入发布", "去发布", "发布")
+    for name in names:
+        try:
+            loc = page.get_by_role("button", name=name, exact=True)
+            if await loc.count() and await loc.first.is_visible():
+                await loc.first.click()
+                douyin_logger.info(_msg("👉", f"上传页点击「{name}」"))
+                return True
+        except Exception:
+            continue
+    return False
+
+
 async def _douyin_upload_input_visible(page: Page) -> bool:
     """上传页 file input 是否已挂载（比登录 Tab 文案更可靠）"""
     try:
@@ -134,8 +192,8 @@ async def _douyin_upload_input_visible(page: Page) -> bool:
 
 async def _douyin_page_has_login_prompt(page: Page) -> bool:
     """检测页面是否仍处于登录态（含慢加载时的登录文案）"""
-    # 抖音上传页 DOM 常残留「扫码登录/密码登录」Tab，但 file input 已可见说明会话有效
-    if await _douyin_upload_input_visible(page):
+    # 抖音上传页 DOM 常残留「扫码登录/密码登录」Tab，但 file input / 上传按钮已可见说明会话有效
+    if await _douyin_upload_button_visible(page) or await _douyin_upload_input_visible(page):
         return False
 
     login_texts = ("手机号登录", "扫码登录", "密码登录")
@@ -153,12 +211,12 @@ async def _douyin_page_has_login_prompt(page: Page) -> bool:
 
 
 async def _douyin_upload_page_ready(page: Page) -> bool:
-    """上传页就绪：URL 正确且出现上传 file input（必须，避免 cookie 失效时误判）"""
+    """上传页就绪：URL 正确且出现上传按钮或 file input"""
     if "content/upload" not in page.url:
         return False
     if await _douyin_page_has_login_prompt(page):
         return False
-    return await _douyin_upload_input_visible(page)
+    return await _douyin_upload_button_visible(page) or await _douyin_upload_input_visible(page)
 
 
 # 抖音新版发布页 URL：离开该页面即视为发布成功（抖音改版后不一定跳到 content/manage，可能跳数据中心/首页）
@@ -2077,7 +2135,7 @@ class DouYinVideo(DouYinBaseUploader):
 
     async def handle_upload_error(self, page):
         douyin_logger.warning(_msg("😵", "视频上传摔了一跤，小人马上重新上传"))
-        await page.locator('div.progress-div [class^="upload-btn-input"]').set_input_files(self.file_path)
+        await _set_douyin_upload_file(page, self.file_path)
 
     async def handle_auto_video_cover(self, page):
         if await page.get_by_text("请设置封面后再发布").first.is_visible():
@@ -2748,15 +2806,18 @@ class DouYinVideo(DouYinBaseUploader):
             raise RuntimeError(f"未能进入抖音上传页: {page.url}")
 
         upload_input = await _find_upload_file_input(page)
-        douyin_logger.info(_msg("🔍", "等待上传页 file input 出现..."))
+        douyin_logger.info(_msg("🔍", "等待上传页「上传视频」按钮或 file input..."))
         try:
-            await upload_input.wait_for(state="attached", timeout=120000)
+            if await _douyin_upload_button_visible(page):
+                douyin_logger.info(_msg("✅", "已看到「上传视频」按钮"))
+            else:
+                await upload_input.wait_for(state="attached", timeout=120000)
         except Exception as exc:
             if await _douyin_page_has_login_prompt(page):
                 raise RuntimeError("cookie文件已失效，请先完成抖音登录") from exc
             raise RuntimeError(f"未能定位抖音上传控件: {page.url}") from exc
-        douyin_logger.info(_msg("📤", "已定位上传控件，开始写入视频文件"))
-        await upload_input.set_input_files(self.file_path)
+        douyin_logger.info(_msg("📤", "开始选择并写入视频文件"))
+        await _set_douyin_upload_file(page, self.file_path)
 
         wait_round = 0
         while True:
@@ -2783,6 +2844,15 @@ class DouYinVideo(DouYinBaseUploader):
                         raise RuntimeError(
                             f"文件写入后未跳发布页，却跳转到了 {page.url}（可能抖音改版：上传完成后需手动点「发布」/「下一步」？）"
                         )
+                    # 仍停在拖拽区：说明没真正选上文件，再点一次「上传视频」
+                    if wait_round in (4, 20, 40) and await _douyin_upload_button_visible(page):
+                        douyin_logger.warning(_msg("⚠️", "仍停在上传拖拽区，重新点击「上传视频」"))
+                        try:
+                            await _set_douyin_upload_file(page, self.file_path)
+                        except Exception as retry_exc:
+                            douyin_logger.debug(_msg("🔍", f"重试选文件失败: {retry_exc}"))
+                    elif wait_round % 10 == 0:
+                        await _try_click_upload_page_next(page)
                     # 每 10s 记录一次 INFO，避免日志全是 debug
                     if wait_round % 20 == 0:
                         douyin_logger.info(
