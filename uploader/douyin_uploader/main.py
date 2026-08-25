@@ -31,13 +31,30 @@ DOUYIN_SESSION_COOKIE_NAMES = frozenset(
 )
 
 
+def _should_bypass_system_proxy() -> bool:
+    """默认绕过 Windows 系统代理。PLAYWRIGHT_BYPASS_PROXY=false 时保留系统/环境代理。"""
+    val = (os.environ.get("PLAYWRIGHT_BYPASS_PROXY") or "true").strip().lower()
+    return val not in ("0", "false", "no")
+
+
 def _douyin_browser_launch_kwargs(headless: bool) -> dict:
-    """统一 Chrome 启动参数，避免校验用 chrome、上传用 chromium 导致 cookie 行为不一致"""
-    return {
+    """统一 Chrome 启动参数，避免校验用 chrome、上传用 chromium 导致 cookie 行为不一致。
+
+    Windows 下 channel=chrome 会走系统代理；代理软件未开时会出现
+    ERR_PROXY_CONNECTION_FAILED，因此默认 --no-proxy-server 直连。
+    """
+    args = ["--no-sandbox", "--disable-blink-features=AutomationControlled"]
+    kwargs: dict = {
         "headless": headless,
         "channel": "chrome",
-        "args": ["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+        "args": args,
     }
+    if _should_bypass_system_proxy():
+        for flag in ("--no-proxy-server", "--proxy-bypass-list=*"):
+            if flag not in args:
+                args.append(flag)
+        kwargs["proxy"] = {"server": "direct://"}
+    return kwargs
 
 
 def _storage_state_has_douyin_session(account_file: str) -> bool:
