@@ -502,7 +502,13 @@ async def _douyin_set_self_declaration_entry(page: Page) -> bool:
                 await loc.click(force=True, timeout=4000)
             except Exception:
                 # Playwright click 被遮罩拦截 → 退回浏览器原生事件
-                await loc.evaluate("el => el.scrollIntoView({block:'center'}); el.click();")
+                # 必须用块级函数体：无花括号时 `el.click()` 会落在箭头函数外，触发 ReferenceError: el is not defined
+                await loc.evaluate(
+                    """(el) => {
+                        el.scrollIntoView({block: 'center'});
+                        el.click();
+                    }"""
+                )
             _DEBUG and douyin_logger.info(f"[声明入口-{tag}] 点击成功")
             return True
         except Exception as exc:
@@ -1006,48 +1012,215 @@ class DouYinBaseUploader(BaseVideoUploader):
         await asyncio.sleep(1)
 
     async def _focus_description_editor(self, page: Page):
-        """聚焦作品简介编辑器。发布页常有浮层拦截普通 click，需多策略兜底。"""
+        """聚焦作品简介编辑器。
+
+        实测（2026-09）：元素能 resolve（zone-container / 添加作品简介），但 Playwright
+        click/focus 常在「performing click action」卡住（浮层拦截 pointer）。
+        优先用 JS focus + 派发鼠标事件，避免每个候选再干等 120s。
+        """
+        # 封面弹层会挡；无弹层时 _dismiss_cover_modals 直接 return（不会乱按 Esc）
+        try:
+            await self._dismiss_cover_modals(page)
+        except Exception:
+            pass
+        # 降低引导/气泡对点击的拦截（不移除节点，只禁 pointer）
+        try:
+            await page.evaluate(
+                """() => {
+                    document.querySelectorAll(
+                      '.semi-popover, .semi-tooltip, .semi-toast-wrapper, '
+                      + '[class*="guide-"], [class*="Guide"], [class*="popover-tip"]'
+                    ).forEach((el) => {
+                      try { el.style.pointerEvents = 'none'; } catch (e) {}
+                    });
+                }"""
+            )
+        except Exception:
+            pass
+
+        # 1) JS 一次定位并激活（最快、最稳）
+        try:
+            activated = await page.evaluate(
+                """() => {
+                    const selectors = [
+                      'div.zone-container[contenteditable="true"][data-placeholder*="简介"]',
+                      'div.editor-comp-publish[contenteditable="true"]',
+                      'div.editor-kit-container[contenteditable="true"]',
+                      'div.zone-container[contenteditable="true"]',
+                      '[data-slate-editor="true"][contenteditable="true"]',
+                      'div[contenteditable="true"][data-placeholder*="简介"]',
+                      'div[contenteditable="true"][data-placeholder*="作品"]',
+                    ];
+                    const visible = (n) => {
+                      const r = n.getBoundingClientRect();
+                      return r.width > 20 && r.height > 10;
+                    };
+                    let el = null;
+                    for (const s of selectors) {
+                      el = Array.from(document.querySelectorAll(s)).find(visible) || null;
+                      if (el) break;
+                    }
+                    if (!el) {
+                      el = Array.from(document.querySelectorAll('[contenteditable="true"]')).find((n) => {
+                        if (!visible(n)) return false;
+                        const ph = (n.getAttribute('data-placeholder') || '')
+                          + (n.getAttribute('placeholder') || '');
+                        const cls = (n.className || '').toString();
+                        return ph.includes('简介') || ph.includes('作品')
+                          || cls.includes('zone-container') || cls.includes('editor-kit');
+                      }) || null;
+                    }
+                    const dump = Array.from(document.querySelectorAll('[contenteditable="true"]'))
+                      .slice(0, 8)
+                      .map((n) => ({
+                        ph: n.getAttribute('data-placeholder') || '',
+                        cls: (n.className || '').toString().slice(0, 100),
+                        w: Math.round(n.getBoundingClientRect().width),
+                        h: Math.round(n.getBoundingClientRect().height),
+                      }));
+                    if (!el) return { ok: false, reason: 'not_found', dump };
+                    el.scrollIntoView({ block: 'center', inline: 'nearest' });
+                    try { el.focus({ preventScroll: true }); } catch (e) {
+                      try { el.focus(); } catch (e2) {}
+                    }
+                    try {
+                      const sel = window.getSelection();
+                      const range = document.createRange();
+                      range.selectNodeContents(el);
+                      range.collapse(true);
+                      sel.removeAllRanges();
+                      sel.addRange(range);
+                    } catch (e) {}
+                    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                      el.dispatchEvent(new MouseEvent(type, {
+                        bubbles: true, cancelable: true, view: window, buttons: 1,
+                      }));
+                    }
+                    const active = document.activeElement;
+                    return {
+                      ok: true,
+                      activeIsEditor: !!(active && (active === el || el.contains(active))),
+                      placeholder: el.getAttribute('data-placeholder') || '',
+                      className: (el.className || '').toString().slice(0, 120),
+                      dump,
+                    };
+                }"""
+            )
+        except Exception as exc:
+            activated = {"ok": False, "reason": f"evaluate_error:{exc}"}
+            douyin_logger.warning(_msg("⚠️", f"简介框 JS 激活异常: {exc}"))
+
+        if activated and activated.get("ok"):
+            douyin_logger.info(
+                _msg(
+                    "📝",
+                    "简介框已 JS 激活 "
+                    f"ph={activated.get('placeholder')!r} "
+                    f"active={activated.get('activeIsEditor')} "
+                    f"cls={str(activated.get('className') or '')[:60]}",
+                )
+            )
+            # 给前端一点时间吃掉 focus；不依赖 Playwright focus 成功
+            await page.wait_for_timeout(150)
+            return page.locator(
+                'div.zone-container[contenteditable="true"], '
+                'div.editor-comp-publish[contenteditable="true"], '
+                '[data-slate-editor="true"][contenteditable="true"]'
+            ).first
+
+        dump = (activated or {}).get("dump")
+        if dump:
+            douyin_logger.warning(_msg("⚠️", f"简介框 JS 未命中，页面 contenteditable 快照: {dump}"))
+
+        # 2) Playwright 短超时兜底（force + JS evaluate focus，不再干等 120s）
         candidates = [
-            page.locator('div.zone-container[contenteditable="true"][data-placeholder*="简介"]').first,
-            page.locator('div.zone-container[contenteditable="true"]').first,
-            page.locator('[data-slate-editor="true"][contenteditable="true"]').first,
-            page.locator('div[contenteditable="true"][data-placeholder*="简介"]').first,
+            'div.zone-container[contenteditable="true"][data-placeholder*="简介"]',
+            'div.editor-comp-publish[contenteditable="true"]',
+            'div.zone-container[contenteditable="true"]',
+            '[data-slate-editor="true"][contenteditable="true"]',
+            'div[contenteditable="true"][data-placeholder*="简介"]',
         ]
         last_err = None
-        for editor in candidates:
+        for sel in candidates:
+            editor = page.locator(sel).first
             try:
                 if await editor.count() == 0:
                     continue
-                await editor.wait_for(state="visible", timeout=120000)
-                # 1) 普通点击
+                await editor.wait_for(state="attached", timeout=8000)
                 try:
-                    await editor.click(timeout=8000)
+                    await editor.scroll_into_view_if_needed(timeout=3000)
+                except Exception:
+                    pass
+                # force 点击：绕过遮挡；失败再纯 JS focus
+                try:
+                    await editor.click(force=True, timeout=4000)
+                    douyin_logger.info(_msg("📝", f"简介框 force 点击成功: {sel}"))
                     return editor
                 except Exception as exc:
                     last_err = exc
-                    douyin_logger.warning(_msg("⚠️", f"简介框普通点击失败，尝试 force: {exc}"))
-                # 2) force 点击（绕过遮挡层）
+                    douyin_logger.debug(_msg("🔍", f"简介框 force 点击失败 ({sel}): {exc}"))
                 try:
-                    await editor.click(force=True, timeout=8000)
-                    return editor
-                except Exception as exc:
-                    last_err = exc
-                # 3) 直接 focus + 再点一次坐标中心
-                try:
-                    await editor.focus(timeout=5000)
-                    box = await editor.bounding_box()
-                    if box:
-                        await page.mouse.click(
-                            box["x"] + box["width"] / 2,
-                            box["y"] + min(24.0, box["height"] / 2),
-                        )
+                    await editor.evaluate(
+                        """(el) => {
+                            el.scrollIntoView({block:'center'});
+                            el.focus();
+                            el.click();
+                        }"""
+                    )
+                    douyin_logger.info(_msg("📝", f"简介框 locator.evaluate 激活成功: {sel}"))
                     return editor
                 except Exception as exc:
                     last_err = exc
             except Exception as exc:
                 last_err = exc
                 continue
-        raise RuntimeError(f"无法聚焦作品简介编辑框: {last_err}")
+        raise RuntimeError(f"无法聚焦作品简介编辑框: {last_err}; dump={dump}")
+
+    async def _insert_description_text(self, page: Page, text: str) -> None:
+        """向已聚焦的简介框写入文本（键盘优先，execCommand / 剪贴板兜底）。"""
+        body = (text or "")[:1000]
+        if not body:
+            return
+        try:
+            await page.keyboard.insert_text(body)
+            return
+        except Exception as exc:
+            douyin_logger.warning(_msg("⚠️", f"keyboard.insert_text 失败，尝试 execCommand: {exc}"))
+        try:
+            ok = await page.evaluate(
+                """(t) => {
+                    try {
+                      return document.execCommand('insertText', false, t);
+                    } catch (e) {
+                      return false;
+                    }
+                }""",
+                body,
+            )
+            if ok:
+                return
+        except Exception as exc:
+            douyin_logger.debug(_msg("🔍", f"execCommand insertText 失败: {exc}"))
+        # 最后：写入 contenteditable 末尾文本节点（Slate 可能不完美，但总比空着强）
+        try:
+            await page.evaluate(
+                """(t) => {
+                    const el = document.querySelector(
+                      'div.zone-container[contenteditable="true"], '
+                      + 'div.editor-comp-publish[contenteditable="true"], '
+                      + '[data-slate-editor="true"][contenteditable="true"]'
+                    );
+                    if (!el) return false;
+                    el.focus();
+                    // 尽量保留已有结构，追加文本节点
+                    el.appendChild(document.createTextNode(t));
+                    el.dispatchEvent(new InputEvent('input', { bubbles: true, data: t }));
+                    return true;
+                }""",
+                body,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"写入作品简介失败: {exc}") from exc
 
     async def fill_title_and_description(self, page: Page, title: str, description: str, tags: list[str] | None = None):
         # 2026-06 抖音发布页 DOM：标题=input[placeholder*=填写作品标题]，描述=div.zone-container[contenteditable]
@@ -1056,22 +1229,23 @@ class DouYinBaseUploader(BaseVideoUploader):
         await title_input.wait_for(state="visible", timeout=120000)
         await title_input.fill((title or "")[:30])
 
-        # 关掉可能挡住简介框的提示/下拉
+        # 勿在此处按 Escape：新版底部「发布/暂存离开」会把 Esc 当成暂存离开跳首页
         try:
-            await page.keyboard.press("Escape")
-            await asyncio.sleep(0.2)
+            await self._dismiss_cover_modals(page)
         except Exception:
             pass
 
         await self._focus_description_editor(page)
-        await page.keyboard.press("Control+A")
-        await page.keyboard.press("Backspace")
+        try:
+            await page.keyboard.press("Control+A")
+            await page.keyboard.press("Backspace")
+        except Exception:
+            pass
 
-        # 先写简介正文（insert_text 整段粘贴，避免逐字过慢）
+        # 先写简介正文
         body = (description or "").strip()
         if body:
-            # 抖音作品描述常见上限约 1000 字，留余量
-            await page.keyboard.insert_text(body[:1000])
+            await self._insert_description_text(page, body)
             douyin_logger.info(_msg("📝", f"已填入简介 {min(len(body), 1000)} 字"))
         else:
             douyin_logger.warning(_msg("⚠️", "简介为空，仅填写话题"))
@@ -1080,9 +1254,16 @@ class DouYinBaseUploader(BaseVideoUploader):
             tag_text = str(tag).strip().lstrip("#")
             if not tag_text:
                 continue
-            await page.keyboard.insert_text(f" #{tag_text}")
-            await page.keyboard.press("Space")
-        await page.keyboard.press("Escape")  # 收起话题下拉，避免浮层拦截后续点击
+            try:
+                await page.keyboard.insert_text(f" #{tag_text}")
+                await page.keyboard.press("Space")
+            except Exception:
+                await self._insert_description_text(page, f" #{tag_text} ")
+        # 话题联想下拉：点一下标题区收起，避免 Esc 触发暂存离开
+        try:
+            await title_input.click(force=True, timeout=2000)
+        except Exception:
+            pass
         await asyncio.sleep(0.3)
 
     async def set_location(self, page: Page, location: str = ""):
@@ -1820,8 +2001,13 @@ class DouYinBaseUploader(BaseVideoUploader):
             "内容由 AI 生成",
             "内容为AI生成",
             "内容为 AI 生成",
+            "内容由人工智能生成",
+            "内容由人工智能 生成",
+            "AI生成",
+            "人工智能生成",
             "内容为个人观点或见解",
             "内容为个人观点或见解（非事实）",
+            "内容为个人观点",
         ]
         # 封面弹层未关时会拦截点击（pointer-events），先清掉
         try:
@@ -1863,6 +2049,26 @@ class DouYinBaseUploader(BaseVideoUploader):
                 _fail("点击自主声明入口后未打开弹窗（两版标题均未出现）")
                 return
 
+        # 先把弹窗内可见选项打出来，便于文案改版时对照日志
+        try:
+            option_texts = await dialog.evaluate(
+                """(root) => {
+                    const out = [];
+                    const nodes = root.querySelectorAll(
+                        '.semi-radio, [role="radio"], label, .semi-radio-addon, .semi-radio-content'
+                    );
+                    for (const el of nodes) {
+                        const t = (el.textContent || '').replace(/\\s+/g, ' ').trim();
+                        if (t && t.length < 80 && !out.includes(t)) out.push(t);
+                    }
+                    return out;
+                }"""
+            )
+            douyin_logger.info(_msg("🧾", f"自主声明弹窗选项: {option_texts}"))
+        except Exception as exc:
+            option_texts = []
+            douyin_logger.debug(_msg("🧾", f"读取声明选项失败: {exc}"))
+
         # 单选项：优先点可交互的 .semi-radio 外层，避免 pointer-events:none 的 inner/addon 卡超时
         clicked = False
         for text in declaration_aliases:
@@ -1884,21 +2090,111 @@ class DouYinBaseUploader(BaseVideoUploader):
                     break
             except Exception:
                 pass
+            # 去空格模糊：页面「内容由 AI 生成」vs 配置「内容由AI生成」
+            try:
+                pattern = re.compile(
+                    re.escape(text).replace(r"\ ", r"\s*").replace("AI", r"\s*A\s*I\s*")
+                )
+                fuzzy = dialog.locator(".semi-radio").filter(has_text=pattern).first
+                if await fuzzy.count():
+                    await fuzzy.click(timeout=6000, force=True)
+                    declaration = text
+                    clicked = True
+                    break
+            except Exception:
+                pass
+
+        if not clicked:
+            # JS 兜底：按别名 / 含 AI / 个人观点 点击
+            try:
+                hit = await dialog.evaluate(
+                    """(root, aliases) => {
+                        const norm = (s) => (s || '').replace(/\\s+/g, '').replace(/（/g,'(').replace(/）/g,')');
+                        const aliasN = aliases.map(norm);
+                        const nodes = Array.from(root.querySelectorAll(
+                            '.semi-radio, [role="radio"], label, .semi-radio-content, span, div'
+                        ));
+                        const pick = (pred) => {
+                            for (const el of nodes) {
+                                const t = (el.textContent || '').replace(/\\s+/g, ' ').trim();
+                                if (!t || t.length > 60) continue;
+                                if (pred(t, norm(t))) {
+                                    const clickable = el.closest('.semi-radio') || el;
+                                    clickable.click();
+                                    return t;
+                                }
+                            }
+                            return null;
+                        };
+                        let hit = pick((t, n) => aliasN.some(a => n.includes(a) || a.includes(n)));
+                        if (hit) return hit;
+                        hit = pick((t, n) => n.includes('AI') || n.includes('人工智能'));
+                        if (hit) return hit;
+                        hit = pick((t, n) => n.includes('个人观点'));
+                        return hit;
+                    }""",
+                    declaration_aliases,
+                )
+                if hit:
+                    declaration = str(hit)
+                    clicked = True
+                    douyin_logger.info(_msg("🧾", f"自主声明选项 JS 兜底命中「{declaration}」"))
+            except Exception as exc:
+                douyin_logger.debug(_msg("🧾", f"自主声明 JS 兜底失败: {exc}"))
+
         if not clicked:
             # 没点到选项前先关弹窗，不然遮罩影响后续操作
             try:
                 await dialog.get_by_text("取消", exact=True).first.click(force=True)
             except Exception:
                 pass
-            _fail(f"未找到自主声明选项（已尝试 {declaration_aliases}），请检查页面是否有新增声明类型")
+            _fail(
+                f"未找到自主声明选项（已尝试 {declaration_aliases}；"
+                f"页面选项={option_texts}），请检查页面是否有新增声明类型"
+            )
             return
 
-        # 点确定 → 等待弹窗关闭
-        ok_btn = dialog.get_by_role("button", name="确定")
-        if not await ok_btn.count():
-            # 新版弹窗 footer 的确定按钮可能不是 role=button 精确，用文字兜底
-            ok_btn = dialog.get_by_text("确定", exact=True).first
-        await ok_btn.click(timeout=6000, force=True)
+        # 点确定/确认 → 等待弹窗关闭（新版 footer 常用「确认」）
+        await page.wait_for_timeout(300)
+        confirmed = False
+        confirm_labels = ("确定", "确认", "完成")
+        for label in confirm_labels:
+            try:
+                ok_btn = dialog.get_by_role("button", name=label)
+                if not await ok_btn.count():
+                    ok_btn = dialog.get_by_text(label, exact=True).first
+                if await ok_btn.count():
+                    await ok_btn.click(timeout=6000, force=True)
+                    confirmed = True
+                    douyin_logger.info(_msg("🧾", f"已点击自主声明「{label}」按钮"))
+                    break
+            except Exception as exc:
+                douyin_logger.debug(_msg("🧾", f"点击「{label}」失败: {exc}"))
+        if not confirmed:
+            # JS 兜底：在当前弹窗内找含确定/确认的可点按钮
+            try:
+                confirmed = bool(
+                    await dialog.evaluate(
+                        """(root) => {
+                            const texts = ['确定', '确认', '完成'];
+                            const nodes = root.querySelectorAll('button, [role="button"], .semi-button, span, div');
+                            for (const el of nodes) {
+                                const t = (el.textContent || '').trim();
+                                if (texts.includes(t)) {
+                                    el.click();
+                                    return true;
+                                }
+                            }
+                            return false;
+                        }"""
+                    )
+                )
+            except Exception as exc:
+                douyin_logger.debug(_msg("🧾", f"自主声明确认 JS 兜底失败: {exc}"))
+                confirmed = False
+        if not confirmed:
+            _fail("已选声明类型，但未找到或未能点击「确定/确认」按钮")
+            return
         try:
             await dialog.wait_for(state="hidden", timeout=6000)
         except Exception:
