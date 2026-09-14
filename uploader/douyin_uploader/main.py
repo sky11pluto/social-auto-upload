@@ -25,6 +25,10 @@ from utils.log import douyin_logger
 DOUYIN_PUBLISH_STRATEGY_IMMEDIATE = "immediate"
 DOUYIN_PUBLISH_STRATEGY_SCHEDULED = "scheduled"
 
+# 视频上传失败：同页点「重新上传」易卡在封面弹窗狂刷「不支持的图片格式」；
+# 上层应关闭浏览器并重新走完整发布流程。
+DOUYIN_UPLOAD_NEED_RELAUNCH = "视频上传失败，需关闭浏览器重新发布"
+
 # 登录态 cookie 名（扫码/校验/上传共用）
 DOUYIN_SESSION_COOKIE_NAMES = frozenset(
     {"sessionid", "sessionid_ss", "sid_tt", "uid_tt", "passport_auth_status"}
@@ -151,6 +155,58 @@ async def _douyin_upload_button_visible(page: Page) -> bool:
         return bool(await loc.count()) and await loc.first.is_visible()
     except Exception:
         return False
+
+
+async def _douyin_video_upload_failed(page: Page) -> bool:
+    """视频是否上传失败。
+
+    注意：失败态文案常为「上传失败，重新上传」，也含「重新上传」，
+    绝不可仅凭「重新上传」判定成功。
+    """
+    try:
+        failed = page.get_by_text(re.compile(r"上传失败"))
+        n = await failed.count()
+        for i in range(min(n, 8)):
+            loc = failed.nth(i)
+            try:
+                if await loc.is_visible():
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    try:
+        if await page.locator('div.progress-div >> text=上传失败').count():
+            return True
+    except Exception:
+        pass
+    return False
+
+
+async def _douyin_video_upload_succeeded(page: Page) -> bool:
+    """视频上传成功：出现可重新上传入口，且页面无「上传失败」。"""
+    if await _douyin_video_upload_failed(page):
+        return False
+    try:
+        # 成功后右侧卡片会出现「重新上传」操作
+        number = await page.locator('[class^="long-card"] div:has-text("重新上传")').count()
+        if number > 0:
+            return True
+    except Exception:
+        pass
+    try:
+        # 兼容其它成功态文案
+        done = page.get_by_text(re.compile(r"上传完成|上传成功"))
+        n = await done.count()
+        for i in range(min(n, 5)):
+            try:
+                if await done.nth(i).is_visible():
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
 
 
 async def _set_douyin_upload_file(page: Page, file_path: str) -> None:
@@ -2442,13 +2498,46 @@ class DouYinVideo(DouYinBaseUploader):
 
         self.file_path = str(self.validate_video_file(self.file_path))
         if self.thumbnail_landscape_path:
-            self.thumbnail_landscape_path = str(self.validate_image_file(self.thumbnail_landscape_path))
+            self.thumbnail_landscape_path = str(
+                self._ensure_douyin_cover_image(self.validate_image_file(self.thumbnail_landscape_path))
+            )
         if self.thumbnail_portrait_path:
-            self.thumbnail_portrait_path = str(self.validate_image_file(self.thumbnail_portrait_path))
+            self.thumbnail_portrait_path = str(
+                self._ensure_douyin_cover_image(self.validate_image_file(self.thumbnail_portrait_path))
+            )
+
+    @staticmethod
+    def _ensure_douyin_cover_image(path: Path) -> Path:
+        """抖音封面仅支持 jpg/png/jpeg；webp/bmp 等先转 jpg，避免页面狂弹格式错误。"""
+        path = Path(path)
+        suffix = path.suffix.lower()
+        if suffix in {".jpg", ".jpeg", ".png"}:
+            return path
+        try:
+            from PIL import Image
+        except ImportError:
+            douyin_logger.warning(
+                _msg("⚠️", f"封面格式 {suffix} 抖音可能不支持，且未安装 Pillow，无法转换")
+            )
+            return path
+        try:
+            out = Path(os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp") / (
+                f"douyin_cover_norm_{os.getpid()}_{int(time.time())}.jpg"
+            )
+            with Image.open(path) as im0:
+                im0.convert("RGB").save(out, quality=92)
+            douyin_logger.info(_msg("🧭", f"封面已转为 jpg: {path.name} -> {out.name}"))
+            return out
+        except Exception as exc:
+            douyin_logger.warning(_msg("⚠️", f"封面转 jpg 失败，沿用原图: {exc}"))
+            return path
 
     async def handle_upload_error(self, page):
-        douyin_logger.warning(_msg("😵", "视频上传摔了一跤，小人马上重新上传"))
-        await _set_douyin_upload_file(page, self.file_path)
+        """同页重传已弃用：失败后应由上层关浏览器重开。"""
+        douyin_logger.error(
+            _msg("😵", "视频上传失败，放弃同页重传（将关闭浏览器重新发布）")
+        )
+        raise RuntimeError(DOUYIN_UPLOAD_NEED_RELAUNCH)
 
     async def handle_auto_video_cover(self, page):
         if await page.get_by_text("请设置封面后再发布").first.is_visible():
@@ -3195,17 +3284,28 @@ class DouYinVideo(DouYinBaseUploader):
             douyin_logger.info(_msg("🧾", "自主声明已设置/无需设置（未检测到「请选择自主声明」占位）"))
 
         # 必须等视频传完再挂星图/设封面：传完前「选择封面」常不可用，星图弹层失败还会遮挡封面
+        # 失败文案「上传失败，重新上传」也含「重新上传」，必须先判失败，否则会误当成功去设封面，
+        # 进而狂弹「不支持的图片格式，只支持jpg, png, jpeg」。
+        upload_wait_deadline = time.time() + 3600
         while True:
             try:
-                number = await page.locator('[class^="long-card"] div:has-text("重新上传")').count()
-                if number > 0:
+                if time.time() >= upload_wait_deadline:
+                    raise RuntimeError("视频上传超时（超过 1 小时）")
+                if await _douyin_video_upload_failed(page):
+                    douyin_logger.error(
+                        _msg(
+                            "😵",
+                            "检测到视频上传失败，关闭浏览器后重新发布（不再同页点重新上传）",
+                        )
+                    )
+                    raise RuntimeError(DOUYIN_UPLOAD_NEED_RELAUNCH)
+                if await _douyin_video_upload_succeeded(page):
                     douyin_logger.success(_msg("🥳", "视频已经传完啦"))
                     break
                 douyin_logger.info(_msg("🏃", "小人正在努力上传视频"))
                 await asyncio.sleep(2)
-                if await page.locator('div.progress-div > div:has-text("上传失败")').count():
-                    douyin_logger.error(_msg("😵", "检测到上传失败，小人准备重试"))
-                    await self.handle_upload_error(page)
+            except RuntimeError:
+                raise
             except Exception:
                 douyin_logger.debug(_msg("🧍", "小人还在等视频上传完成"))
                 await asyncio.sleep(2)
