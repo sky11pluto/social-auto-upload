@@ -2344,6 +2344,7 @@ class DouYinVideo(DouYinBaseUploader):
         xingtu_task_id: str | None = None,
         collection_name: str | None = None,
         collection_id: str | None = None,
+        visibility: str = "public",
     ):
         super().__init__(
             publish_date=publish_date,
@@ -2364,6 +2365,11 @@ class DouYinVideo(DouYinBaseUploader):
         # 合集配置：将视频发布到指定的抖音合集中
         self.collection_name = (collection_name or "").strip()
         self.collection_id = (collection_id or "").strip()
+        # 谁可以看：public / friends / private
+        vis = (visibility or "public").strip().lower()
+        if vis not in {"public", "friends", "private"}:
+            vis = "public"
+        self.visibility = vis
 
     async def _select_douyin_collection(self, page: Page) -> bool:
         """
@@ -2490,6 +2496,49 @@ class DouYinVideo(DouYinBaseUploader):
                 _msg("⚠️", f"合集选择后未检测到选中态: {exc}")
             )
             return False
+
+    async def set_visibility(self, page: Page) -> bool:
+        """发布页设置「谁可以看」：public→公开 / friends→好友可见 / private→仅自己可见。"""
+        label_map = {
+            "public": "公开",
+            "friends": "好友可见",
+            "private": "仅自己可见",
+        }
+        target = label_map.get(self.visibility, "公开")
+        if self.visibility == "public":
+            # 默认多为公开，尽量探测；找不到入口也不强求
+            douyin_logger.info(_msg("👀", f"可见范围目标: {target}"))
+        else:
+            douyin_logger.info(_msg("👀", f"小人正在设置谁可以看 = {target}"))
+
+        # 展开「谁可以看」区域（文案或已选值）
+        opened = False
+        for trigger in (
+            page.get_by_text("谁可以看", exact=False).first,
+            page.locator("div:has-text('谁可以看')").locator(
+                "[class*='select'], [class*='radio'], [class*='permission']"
+            ).first,
+        ):
+            try:
+                if await trigger.count() and await trigger.is_visible():
+                    await trigger.click(timeout=5_000)
+                    opened = True
+                    await page.wait_for_timeout(400)
+                    break
+            except Exception:
+                continue
+
+        opt = page.get_by_text(target, exact=True).first
+        try:
+            await opt.wait_for(state="visible", timeout=8_000)
+            await opt.click(timeout=5_000)
+            douyin_logger.success(_msg("🥳", f"已设置谁可以看: {target}"))
+            return True
+        except Exception as exc:
+            if self.visibility == "public" and not opened:
+                douyin_logger.info(_msg("👀", "未找到可见范围入口，沿用页面默认（通常为公开）"))
+                return False
+            raise RuntimeError(f"未能选择可见范围「{target}」: {exc}") from exc
 
     async def validate_upload_args(self):
         await self.validate_base_args()
@@ -3370,6 +3419,12 @@ class DouYinVideo(DouYinBaseUploader):
 
         if self.publish_strategy == DOUYIN_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
             await self.set_schedule_time_douyin(page, self.publish_date)
+
+        # 谁可以看（公开 / 好友可见 / 仅自己可见）
+        try:
+            await self.set_visibility(page)
+        except Exception as exc:
+            douyin_logger.warning(_msg("⚠️", f"设置可见范围失败（继续发布）: {exc}"))
 
         publish_clicked = False  # ⚠️ 状态机：必须点过「发布」按钮后的跳离才算发布成功
         for publish_try in range(120):
