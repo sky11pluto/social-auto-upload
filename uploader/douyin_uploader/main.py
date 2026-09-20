@@ -2374,40 +2374,45 @@ class DouYinVideo(DouYinBaseUploader):
     async def _select_douyin_collection(self, page: Page) -> bool:
         """
         选择抖音合集。
-        根据你提供的三张图：
-        - 选择前：semi-select-collection 是 .semi-select，内含「请选择合集」占位文本
-        - 选择中：弹出 semi-popover，其中是 semi-select-option-list + collection-option
-        - 选择后：semi-select-collection 内部变为 .selected-item-title / .selected-item-extra-text
-
-        返回 True 表示成功选择或保持已选；False 表示不可用。
+        发布页直接点击「请选择合集」下拉，按项目配置的合集名称匹配选项并点击。
         """
         if not self.collection_name:
             return False
+        target_name = self.collection_name.strip()
 
-        # 1) 定位合集下拉框
+        # 1) 定位「请选择合集」下拉（优先占位文案，再回退官方 class）
+        collection_select = None
         try:
             collection_select = page.locator(
-                "div.semi-select.semi-select-collection.semi-select-single"
+                "div.semi-select:has-text('请选择合集')"
             ).first
-            await collection_select.wait_for(state="visible", timeout=8000)
-        except Exception as exc:
-            douyin_logger.warning(
-                _msg("⚠️", f"未找到合集下拉框（可能账号/页面未支持合集）: {exc}")
-            )
-            return False
+            await collection_select.wait_for(state="visible", timeout=5000)
+        except Exception:
+            collection_select = None
+        if collection_select is None:
+            try:
+                collection_select = page.locator(
+                    "div.semi-select.semi-select-collection.semi-select-single"
+                ).first
+                await collection_select.wait_for(state="visible", timeout=5000)
+            except Exception as exc:
+                douyin_logger.warning(
+                    _msg("⚠️", f"未找到合集下拉框（可能账号/页面未支持合集）: {exc}")
+                )
+                return False
 
         # 2) 检查是否已经是目标合集（避免重复点击）
         try:
             current_text = (await collection_select.inner_text(timeout=2000)) or ""
-            if self.collection_name in current_text and "请选择合集" not in current_text:
+            if target_name in current_text and "请选择合集" not in current_text:
                 douyin_logger.info(
-                    _msg("✅", f"合集已选: {self.collection_name}（跳过）")
+                    _msg("✅", f"合集已选: {target_name}（跳过）")
                 )
                 return True
         except Exception:
             pass
 
-        # 3) 点击下拉框打开选择面板
+        # 3) 直接点击「请选择合集」打开选项列表
         try:
             await collection_select.click(force=True)
             await page.wait_for_timeout(600)
@@ -2415,10 +2420,12 @@ class DouYinVideo(DouYinBaseUploader):
             douyin_logger.warning(_msg("⚠️", f"打开合集下拉框失败: {exc}"))
             return False
 
-        # 4) 等待下拉面板出现（semi-popover 包裹 semi-select-option-list）
+        # 4) 等待下拉面板出现
         try:
             await page.wait_for_selector(
-                ".semi-popover-content .semi-select-option-list",
+                ".semi-popover-content .semi-select-option-list, "
+                ".semi-portal .semi-select-option-list, "
+                "[class*='select-option-list']",
                 state="visible",
                 timeout=8000,
             )
@@ -2426,40 +2433,46 @@ class DouYinVideo(DouYinBaseUploader):
             douyin_logger.warning(_msg("⚠️", f"合集选项列表未展开: {exc}"))
             return False
 
-        # 5) 在下拉列表中查找目标合集（注意区分已选中的「已选择」伪元素）
+        # 5) 在下拉列表中查找目标合集
         try:
-            # 定位 collection-option（合集选项，带 collection-option 类）
             options = page.locator(
-                ".semi-popover-content .semi-select-option-list .collection-option"
+                ".semi-popover-content .semi-select-option-list .collection-option, "
+                ".semi-popover-content .semi-select-option-list .semi-select-option, "
+                ".semi-portal .semi-select-option-list .semi-select-option"
             )
             count = await options.count()
             douyin_logger.info(
-                _msg("🔍", f"合集候选数量: {count}（目标: {self.collection_name}）")
+                _msg("🔍", f"合集候选数量: {count}（目标: {target_name}）")
             )
 
             target_idx = -1
             for i in range(count):
                 opt = options.nth(i)
-                text = (await opt.inner_text(timeout=2000)) or ""
-                # 已选中的项会带 .semi-select-option-selected，跳过
+                text = ((await opt.inner_text(timeout=2000)) or "").strip()
                 klass = (await opt.get_attribute("class") or "")
+                if "semi-select-option-selected" in klass and target_name in text:
+                    # 已选中目标也算成功
+                    try:
+                        await page.keyboard.press("Escape")
+                    except Exception:
+                        pass
+                    return True
                 if "semi-select-option-selected" in klass:
                     continue
-                if self.collection_name in text:
+                # 精确优先，其次包含匹配
+                if text == target_name or target_name in text:
                     target_idx = i
-                    break
+                    if text == target_name:
+                        break
 
             if target_idx < 0:
-                # 候选中没有目标合集 → 抖音未自动创建同名合集
-                # 这里不做「新建合集」（抖音创作者中心需到「合集管理」手动创建）
                 douyin_logger.warning(
                     _msg(
                         "⚠️",
-                        f"未在候选中找到合集「{self.collection_name}」。"
+                        f"未在候选中找到合集「{target_name}」。"
                         "请先在抖音创作者中心→合集管理中创建该合集。",
                     )
                 )
-                # 关闭面板（点击页面其他位置或 ESC）
                 try:
                     await page.keyboard.press("Escape")
                     await page.wait_for_timeout(300)
@@ -2477,20 +2490,29 @@ class DouYinVideo(DouYinBaseUploader):
                 pass
             return False
 
-        # 6) 校验：semi-select-collection 内部出现 selected-item-title 即视为成功
+        # 6) 校验选中态
         try:
-            await page.wait_for_selector(
-                "div.semi-select.semi-select-collection .selected-item-title",
-                state="visible",
-                timeout=5000,
+            await page.wait_for_timeout(400)
+            current = (await collection_select.inner_text(timeout=3000)) or ""
+            if target_name in current and "请选择合集" not in current:
+                douyin_logger.success(_msg("🥳", f"已选择合集: {target_name}"))
+                return True
+            # 兼容 selected-item-title
+            title_loc = page.locator(
+                "div.semi-select.semi-select-collection .selected-item-title, "
+                "div.semi-select:has(.selected-item-title) .selected-item-title"
+            ).first
+            if await title_loc.count():
+                selected_title = (await title_loc.inner_text(timeout=2000)) or ""
+                if target_name in selected_title:
+                    douyin_logger.success(
+                        _msg("🥳", f"已选择合集: {selected_title}")
+                    )
+                    return True
+            douyin_logger.warning(
+                _msg("⚠️", f"合集选择后未检测到选中态，当前文案={current[:80]!r}")
             )
-            selected_title = await page.locator(
-                "div.semi-select.semi-select-collection .selected-item-title"
-            ).first.inner_text(timeout=2000)
-            douyin_logger.success(
-                _msg("🥳", f"已选择合集: {selected_title}")
-            )
-            return True
+            return False
         except Exception as exc:
             douyin_logger.warning(
                 _msg("⚠️", f"合集选择后未检测到选中态: {exc}")
@@ -2498,18 +2520,24 @@ class DouYinVideo(DouYinBaseUploader):
             return False
 
     async def set_visibility(self, page: Page) -> bool:
-        """发布页设置「谁可以看」：public→公开 / friends→好友可见 / private→仅自己可见。"""
+        """发布页设置「谁可以看」：public→公开 / friends→好友可见 / private→仅自己可见。
+
+        发布页默认已是「公开」：目标为 public 时不操作，避免误点其它「公开」文案超时。
+        """
         label_map = {
             "public": "公开",
             "friends": "好友可见",
             "private": "仅自己可见",
         }
-        target = label_map.get(self.visibility, "公开")
-        if self.visibility == "public":
-            # 默认多为公开，尽量探测；找不到入口也不强求
-            douyin_logger.info(_msg("👀", f"可见范围目标: {target}"))
-        else:
-            douyin_logger.info(_msg("👀", f"小人正在设置谁可以看 = {target}"))
+        vis = (self.visibility or "public").strip().lower()
+        if vis not in label_map:
+            vis = "public"
+        if vis == "public":
+            douyin_logger.info(_msg("👀", "可见范围目标为公开，沿用页面默认，跳过设置"))
+            return True
+
+        target = label_map[vis]
+        douyin_logger.info(_msg("👀", f"小人正在设置谁可以看 = {target}"))
 
         # 展开「谁可以看」区域（文案或已选值）
         opened = False
@@ -2535,9 +2563,6 @@ class DouYinVideo(DouYinBaseUploader):
             douyin_logger.success(_msg("🥳", f"已设置谁可以看: {target}"))
             return True
         except Exception as exc:
-            if self.visibility == "public" and not opened:
-                douyin_logger.info(_msg("👀", "未找到可见范围入口，沿用页面默认（通常为公开）"))
-                return False
             raise RuntimeError(f"未能选择可见范围「{target}」: {exc}") from exc
 
     async def validate_upload_args(self):
