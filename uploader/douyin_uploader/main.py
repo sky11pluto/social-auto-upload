@@ -2491,26 +2491,68 @@ class DouYinVideo(DouYinBaseUploader):
             return False
 
         # 6) 校验选中态
+        # 注意：选中后触发器不再含「请选择合集」，不可继续用步骤1的 has-text 定位器，
+        # 否则会超时误判为失败（页面实际可能已选中）。
         try:
             await page.wait_for_timeout(400)
-            current = (await collection_select.inner_text(timeout=3000)) or ""
-            if target_name in current and "请选择合集" not in current:
-                douyin_logger.success(_msg("🥳", f"已选择合集: {target_name}"))
-                return True
-            # 兼容 selected-item-title
+
+            def _selected_ok(text: str) -> bool:
+                t = (text or "").strip()
+                return bool(t) and target_name in t and "请选择合集" not in t
+
+            # 优先读合集专用选中标题
             title_loc = page.locator(
                 "div.semi-select.semi-select-collection .selected-item-title, "
+                "div.semi-select-collection .selected-item-title, "
                 "div.semi-select:has(.selected-item-title) .selected-item-title"
             ).first
-            if await title_loc.count():
-                selected_title = (await title_loc.inner_text(timeout=2000)) or ""
-                if target_name in selected_title:
-                    douyin_logger.success(
-                        _msg("🥳", f"已选择合集: {selected_title}")
+            try:
+                if await title_loc.count():
+                    selected_title = (await title_loc.inner_text(timeout=2000)) or ""
+                    if _selected_ok(selected_title):
+                        douyin_logger.success(
+                            _msg("🥳", f"已选择合集: {selected_title}")
+                        )
+                        return True
+            except Exception:
+                pass
+
+            # 再读合集下拉整体文案（不依赖「请选择合集」占位）
+            for sel in (
+                "div.semi-select.semi-select-collection.semi-select-single",
+                "div.semi-select.semi-select-collection",
+            ):
+                try:
+                    loc = page.locator(sel).first
+                    await loc.wait_for(state="visible", timeout=2000)
+                    current = (await loc.inner_text(timeout=2000)) or ""
+                    if _selected_ok(current):
+                        douyin_logger.success(
+                            _msg("🥳", f"已选择合集: {target_name}")
+                        )
+                        return True
+                except Exception:
+                    continue
+
+            # 占位「请选择合集」已消失，通常表示已选中（页面结构变动时的兜底）
+            try:
+                placeholder = page.locator(
+                    "div.semi-select:has-text('请选择合集')"
+                ).first
+                still_placeholder = await placeholder.is_visible(timeout=800)
+            except Exception:
+                still_placeholder = False
+            if not still_placeholder:
+                douyin_logger.success(
+                    _msg(
+                        "🥳",
+                        f"已选择合集: {target_name}（占位已消失，按选中处理）",
                     )
-                    return True
+                )
+                return True
+
             douyin_logger.warning(
-                _msg("⚠️", f"合集选择后未检测到选中态，当前文案={current[:80]!r}")
+                _msg("⚠️", f"合集选择后未检测到选中态（目标: {target_name}）")
             )
             return False
         except Exception as exc:
