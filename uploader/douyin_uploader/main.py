@@ -1306,8 +1306,14 @@ class DouYinBaseUploader(BaseVideoUploader):
         else:
             douyin_logger.warning(_msg("⚠️", "简介为空，仅填写话题"))
 
-        for tag in tags or []:
+        for tag in (tags or [])[:5]:
             tag_text = str(tag).strip().lstrip("#")
+            # 剧名里的「，」等标点会把一个话题拆成多个，写入前去掉
+            tag_text = re.sub(
+                r"[，,、|/；;：:。.!！?？·•…\-—_~～@\"“”‘’「」『』《》【】\[\]()（）<>〈〉\s]+",
+                "",
+                tag_text,
+            )
             if not tag_text:
                 continue
             try:
