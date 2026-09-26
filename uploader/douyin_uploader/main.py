@@ -3377,6 +3377,13 @@ class DouYinVideo(DouYinBaseUploader):
                             douyin_logger.debug(_msg("🔍", f"重试选文件失败: {retry_exc}"))
                     elif wait_round % 10 == 0:
                         await _try_click_upload_page_next(page)
+                    # 拖拽区空转超过约 60s：多半是成片损坏（无 moov）被抖音静默拒绝，直接失败
+                    if wait_round >= 120 and await _douyin_upload_button_visible(page):
+                        raise RuntimeError(
+                            "选文件后仍停在上传拖拽区超过 60s（页面未进编辑页）。"
+                            "常见原因：成片 MP4 不完整/损坏（缺 moov）、或文件未被抖音接受。"
+                            "请检查成片能否本地播放，必要时重新二创后再发布。"
+                        )
                     # 每 10s 记录一次 INFO，避免日志全是 debug
                     if wait_round % 20 == 0:
                         douyin_logger.info(
@@ -3500,7 +3507,9 @@ class DouYinVideo(DouYinBaseUploader):
             douyin_logger.warning(_msg("⚠️", f"设置可见范围失败（继续发布）: {exc}"))
 
         publish_clicked = False  # ⚠️ 状态机：必须点过「发布」按钮后的跳离才算发布成功
-        for publish_try in range(120):
+        # 点击发布超过 10 次仍未离开发布页则放弃，避免日限/弹窗卡住时空转近小时
+        _PUBLISH_CLICK_MAX = 10
+        for publish_try in range(_PUBLISH_CLICK_MAX):
             try:
                 # 记录点击前 URL，便于事后排查"未点发布就跳转"
                 url_before = page.url
@@ -3574,13 +3583,18 @@ class DouYinVideo(DouYinBaseUploader):
                         _msg("😵", f"第{publish_try+1}次发布尝试异常: {type(_exc).__name__}: {_exc} | 当前URL: {page.url}")
                     )
                 await self.handle_auto_video_cover(page)
-                if publish_try % 10 == 0:
-                    douyin_logger.info(_msg("🏃", f"小人正在冲刺发布视频（{publish_try + 1}/120）"))
+                if publish_try % 5 == 0:
+                    douyin_logger.info(
+                        _msg("🏃", f"小人正在冲刺发布视频（{publish_try + 1}/{_PUBLISH_CLICK_MAX}）")
+                    )
                 if self.debug:
                     await page.screenshot(full_page=True)
                 await asyncio.sleep(0.5)
         else:
-            raise RuntimeError("抖音发布超时：多次点击发布仍未离开发布页（内容管理/数据中心皆未跳转）")
+            raise RuntimeError(
+                f"抖音发布超时：点击发布 {_PUBLISH_CLICK_MAX} 次仍未离开发布页"
+                "（可能已达日限/弹窗拦截，请勿继续空转）"
+            )
 
         await context.storage_state(path=self.account_file)
         douyin_logger.success(_msg("🥳", "cookie 更新完毕"))
@@ -3685,7 +3699,8 @@ class DouYinNote(DouYinBaseUploader):
         if self.publish_strategy == DOUYIN_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
             await self.set_schedule_time_douyin(page, self.publish_date)
 
-        for publish_try in range(120):
+        _PUBLISH_CLICK_MAX = 10
+        for publish_try in range(_PUBLISH_CLICK_MAX):
             try:
                 # 点发布按钮：多选择器兜底（2026-08 抖音改版）
                 await _douyin_click_publish_button(page)
@@ -3702,11 +3717,13 @@ class DouYinNote(DouYinBaseUploader):
                 break
             except Exception:
                 douyin_logger.info(
-                    _msg("🏃", f"小人正在冲刺发布图文（{publish_try + 1}/120）")
+                    _msg("🏃", f"小人正在冲刺发布图文（{publish_try + 1}/{_PUBLISH_CLICK_MAX}）")
                 )
                 await asyncio.sleep(0.5)
         else:
-            raise RuntimeError("图文发布超时：多次点击发布仍未离开发布页")
+            raise RuntimeError(
+                f"图文发布超时：点击发布 {_PUBLISH_CLICK_MAX} 次仍未离开发布页"
+            )
 
     async def upload(self, playwright: Playwright) -> None:
         douyin_logger.info(_msg("🧍", "小人先检查 cookie、图片和发布时间"))

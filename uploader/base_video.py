@@ -35,6 +35,19 @@ class BaseVideoUploader:
             raise ValueError(
                 f"不支持的视频格式: {path.suffix}，当前支持: {', '.join(sorted(cls.SUPPORTED_VIDEO_EXTENSIONS))}"
             )
+        # MP4 无 moov 原子 = FFmpeg 未写完/被中断的残缺文件；抖音会静默拒绝，页面一直停在拖拽上传区
+        if path.suffix.lower() in {".mp4", ".m4v", ".mov"}:
+            try:
+                data = path.read_bytes()
+            except OSError as exc:
+                raise ValueError(f"无法读取视频文件: {path} ({exc})") from exc
+            if len(data) < 64:
+                raise ValueError(f"视频文件过小或损坏: {path}（{len(data)} bytes）")
+            if b"moov" not in data:
+                raise ValueError(
+                    f"视频文件不完整（缺少 moov，多为二创中断残留）: {path}。"
+                    "请重新二创生成成片后再发布，勿继续空等上传页。"
+                )
 
         return path
 
