@@ -1612,12 +1612,10 @@ class DouYinBaseUploader(BaseVideoUploader):
             except Exception:
                 await page.keyboard.insert_text(query)
         douyin_logger.info(_msg("⭐", f"已填入星图搜索词（{len(query)} 字符）"))
-        # 等搜索结果渲染（接口慢时不再死等；最多 1s+5s 轮询）
-        # 命中后立即跳出进入 radio card 匹配；未命中也不阻塞，_select_xingtu_via_radio_card 内部
-        # 仍会按弹窗内任务卡二次匹配（方案C 兜底）
-        await asyncio.sleep(1.0)
+        # 等搜索结果渲染：命中后立刻勾选；未命中也不久等（卡片轮询会兜底）
+        await asyncio.sleep(0.35)
         search_hit = False
-        for _ in range(10):
+        for _ in range(6):
             hit = await page.evaluate(
                 """(qid) => {
                   const t = document.body ? document.body.innerText : '';
@@ -1628,7 +1626,7 @@ class DouYinBaseUploader(BaseVideoUploader):
             if hit:
                 search_hit = True
                 break
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.2)
         douyin_logger.info(
             _msg("⭐", f"星图搜索词检测完成 hit={search_hit}")
         )
@@ -1654,14 +1652,14 @@ class DouYinBaseUploader(BaseVideoUploader):
                     f"星图 radio 未真正选中（ID={query}），已中止以免空点确定"
                 )
 
-        await asyncio.sleep(0.4)
+        await asyncio.sleep(0.15)
         confirmed = await self._confirm_xingtu_selection(page)
         if not confirmed:
             await self._dump_xingtu_debug(page, query)
             await self._dismiss_xingtu_overlays(page)
             raise TimeoutError("已勾选星图任务，但未找到可用的「确定」按钮（semi-modal-footer）")
         douyin_logger.info(_msg("🥳", "已点击星图弹窗「确定」"))
-        await asyncio.sleep(0.8)
+        await asyncio.sleep(0.35)
 
         # 硬校验：入口不能还是「请选择星图任务」
         if await self._xingtu_still_unmounted(page):
@@ -1710,7 +1708,7 @@ class DouYinBaseUploader(BaseVideoUploader):
     async def _click_xingtu_card_radio(self, page: Page, modal, card) -> str | None:
         """在星图弹窗内点选任务卡；只认弹窗内的真实选中态。"""
         await card.scroll_into_view_if_needed()
-        await page.wait_for_timeout(200)
+        await page.wait_for_timeout(80)
 
         # 1) 弹窗内原生 label.click()（比 page.mouse 坐标更稳，且不误点页外节点）
         try:
@@ -1728,7 +1726,7 @@ class DouYinBaseUploader(BaseVideoUploader):
                   return checked && (inner || svg);
                 }"""
             )
-            await page.wait_for_timeout(350)
+            await page.wait_for_timeout(150)
             if ok or await self._modal_radio_really_checked(modal):
                 return "label.click()"
         except Exception as exc:
@@ -1746,7 +1744,7 @@ class DouYinBaseUploader(BaseVideoUploader):
                 if not await loc.count() or not await loc.is_visible():
                     continue
                 await loc.click(timeout=4000)
-                await page.wait_for_timeout(400)
+                await page.wait_for_timeout(180)
                 if await self._modal_radio_really_checked(modal):
                     return via
             except Exception:
@@ -1758,7 +1756,7 @@ class DouYinBaseUploader(BaseVideoUploader):
             if await radio.count():
                 await radio.focus()
                 await page.keyboard.press("Space")
-                await page.wait_for_timeout(400)
+                await page.wait_for_timeout(180)
                 if await self._modal_radio_really_checked(modal):
                     return "keyboard-space"
         except Exception:
@@ -1776,14 +1774,14 @@ class DouYinBaseUploader(BaseVideoUploader):
             return False
 
         cards = modal.locator('[class*="card-container"]')
-        # 等弹窗内出现任务卡片（最多 20*0.4s=8s；典型 1-2s 内即可命中）
-        for _ in range(20):
+        # 等弹窗内出现任务卡片（最多 12*0.2s≈2.4s；典型很快命中）
+        for _ in range(12):
             try:
                 if await cards.count() > 0:
                     break
             except Exception:
                 pass
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.2)
 
         n = await cards.count()
         douyin_logger.info(_msg("⭐", f"[方案A-radio] 弹窗内任务卡片数={n}"))
@@ -1973,7 +1971,7 @@ class DouYinBaseUploader(BaseVideoUploader):
                 douyin_logger.warning(_msg("⚠️", "星图「确定」按钮禁用"))
                 return False
             await btn.click(timeout=5000)
-            await page.wait_for_timeout(600)
+            await page.wait_for_timeout(280)
             return True
         except Exception as exc:
             douyin_logger.warning(_msg("⚠️", f"点击星图确定失败: {exc}"))
@@ -3395,7 +3393,8 @@ class DouYinVideo(DouYinBaseUploader):
 
         await asyncio.sleep(1)
         douyin_logger.info(_msg("✍️", "小人开始填标题、描述和话题"))
-        await self.fill_title_and_description(page, self.title, self.desc or self.title, self.tags)
+        # 简介允许为空：只填话题；勿回退成标题，否则会把标题再写进简介区
+        await self.fill_title_and_description(page, self.title, self.desc or "", self.tags)
         douyin_logger.info(_msg("🏷️", f"小人一共贴了 {len(self.tags)} 个话题"))
 
         # ⚡ 前移自主声明设置：填完标题/话题就立即尝试（与视频上传并行，不等待上传完成）
