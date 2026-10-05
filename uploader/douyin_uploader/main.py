@@ -183,6 +183,83 @@ async def _douyin_video_upload_failed(page: Page) -> bool:
     return False
 
 
+_TOAST_SELECTORS = (
+    ".semi-toast",
+    ".semi-toast-content",
+    ".semi-toast-wrapper .semi-toast",
+    "[class*='semi-toast']",
+    "[role='alert']",
+    "[class*='notification']",
+)
+
+# 平台拦截/失败类提示关键词（避免误抓普通说明文案）
+_TOAST_FAIL_HINT = re.compile(
+    r"(抱歉|上限|失败|请明天|验证|异常|不可|不允许|无法|审核|限制|"
+    r"达到|次数|违规|封禁|登录|过期|稍后|重试|未通过|禁止)"
+)
+
+
+def _format_douyin_platform_tip(raw: str) -> str:
+    """统一包装，便于上层识别为抖音平台原文提示（含日投稿上限）。"""
+    text = re.sub(r"\s+", " ", (raw or "").strip())
+    text = text.replace("×", "").replace("✕", "").replace("✖", "").strip(" -|")
+    if not text:
+        return ""
+    if text.startswith("抖音平台提示"):
+        return text
+    return f"抖音平台提示：{text}"
+
+
+async def _douyin_read_platform_toast(page: Page) -> str:
+    """读取发布页顶部 toast / 错误条原文（如日投稿上限）；无则返回空串。"""
+    candidates: list[str] = []
+
+    for sel in _TOAST_SELECTORS:
+        try:
+            locs = page.locator(sel)
+            n = await locs.count()
+            for i in range(min(n, 8)):
+                loc = locs.nth(i)
+                try:
+                    if not await loc.is_visible():
+                        continue
+                    text = (await loc.inner_text() or "").strip()
+                    text = re.sub(r"\s+", " ", text)
+                    if len(text) >= 4:
+                        candidates.append(text)
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    # 文案兜底：常见拦截提示不一定挂在 toast class 上
+    try:
+        hit = page.get_by_text(
+            re.compile(r"抱歉|投稿次数|今天.*上限|请明天再试|发布失败|上传失败")
+        )
+        n = await hit.count()
+        for i in range(min(n, 6)):
+            loc = hit.nth(i)
+            try:
+                if not await loc.is_visible():
+                    continue
+                text = (await loc.inner_text() or "").strip()
+                text = re.sub(r"\s+", " ", text)
+                if len(text) >= 4:
+                    candidates.append(text)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    for text in candidates:
+        if len(text) > 240:
+            continue
+        if _TOAST_FAIL_HINT.search(text):
+            return text
+    return ""
+
+
 async def _douyin_video_upload_succeeded(page: Page) -> bool:
     """视频上传成功：出现可重新上传入口，且页面无「上传失败」。"""
     if await _douyin_video_upload_failed(page):
@@ -3549,6 +3626,11 @@ class DouYinVideo(DouYinBaseUploader):
                 if clicked:
                     publish_clicked = True  # ★ 状态机翻转：此后的跳离才算发布成功
                     douyin_logger.info(_msg("👆", f"已点击发布按钮（第{publish_try+1}次），点击前URL: {url_before}"))
+                    # 点击后先扫 toast：日限额等；无论是否已跳离页面，平台拦截提示一律失败
+                    await asyncio.sleep(1.2)
+                    tip = await _douyin_read_platform_toast(page)
+                    if tip:
+                        raise RuntimeError(_format_douyin_platform_tip(tip))
                 elif publish_try % 10 == 9:
                     douyin_logger.warning(
                         _msg("😵", f"未定位到「发布」按钮（第{publish_try+1}次重试），继续等待页面加载…")
@@ -3558,11 +3640,18 @@ class DouYinVideo(DouYinBaseUploader):
                 #   (a) publish_clicked == True（已经真的点过「发布」按钮）
                 #   (b) 离开发布/上传页（抖音改版后不一定跳到 content/manage，
                 #       可能跳数据中心/创作者首页，只要 URL 不是发布页即算成功）
+                #   且页面无「投稿次数超限」等平台拦截 toast（toast 优先于 URL 跳转）
                 if publish_clicked:
                     for _wait in range(4):  # 点后最多等 3*4=12s 确认跳转
+                        tip = await _douyin_read_platform_toast(page)
+                        if tip:
+                            raise RuntimeError(_format_douyin_platform_tip(tip))
                         if _douyin_left_publish_page(page):
                             break
                         await asyncio.sleep(3)
+                    tip = await _douyin_read_platform_toast(page)
+                    if tip:
+                        raise RuntimeError(_format_douyin_platform_tip(tip))
                     if not _douyin_left_publish_page(page):
                         raise RuntimeError(f"发布按钮点击后仍未离开发布页: {page.url}")
                     douyin_logger.success(
@@ -3573,8 +3662,9 @@ class DouYinVideo(DouYinBaseUploader):
                     # 没点到发布就不进入等待跳转，继续重试（避免没必要地 sleep 12s）
                     await asyncio.sleep(1)
             except Exception as _exc:
-                # 如果是"未点发布就跳离"这种致命错误，直接抛出，不再重试
-                if "未点击「发布」按钮却已跳离发布页" in str(_exc):
+                err = str(_exc)
+                # 平台原文提示 / 未点发布就跳离：直接抛出，勿空转重试
+                if "抖音平台提示" in err or "未点击「发布」按钮却已跳离发布页" in err:
                     raise
                 # 关键：绑定异常并打印，否则失败原因完全不可见（之前静默吞掉导致日志只有"冲刺"无法定位）
                 if publish_try < 3 or publish_try % 5 == 0:
@@ -3590,6 +3680,9 @@ class DouYinVideo(DouYinBaseUploader):
                     await page.screenshot(full_page=True)
                 await asyncio.sleep(0.5)
         else:
+            tip = await _douyin_read_platform_toast(page)
+            if tip:
+                raise RuntimeError(_format_douyin_platform_tip(tip))
             raise RuntimeError(
                 f"抖音发布超时：点击发布 {_PUBLISH_CLICK_MAX} 次仍未离开发布页"
                 "（可能已达日限/弹窗拦截，请勿继续空转）"
@@ -3703,23 +3796,38 @@ class DouYinNote(DouYinBaseUploader):
             try:
                 # 点发布按钮：多选择器兜底（2026-08 抖音改版）
                 await _douyin_click_publish_button(page)
-                # 发布成功判断：离开发布/上传页（抖音改版后不一定跳到 content/manage）
+                await asyncio.sleep(1.2)
+                tip = await _douyin_read_platform_toast(page)
+                if tip:
+                    raise RuntimeError(_format_douyin_platform_tip(tip))
+                # 发布成功判断：离开发布/上传页；平台 toast 优先于 URL 跳转
                 for _wait in range(4):
+                    tip = await _douyin_read_platform_toast(page)
+                    if tip:
+                        raise RuntimeError(_format_douyin_platform_tip(tip))
                     if _douyin_left_publish_page(page):
                         break
                     await asyncio.sleep(3)
+                tip = await _douyin_read_platform_toast(page)
+                if tip:
+                    raise RuntimeError(_format_douyin_platform_tip(tip))
                 if not _douyin_left_publish_page(page):
                     raise RuntimeError(f"图文发布点击后仍未离开发布页: {page.url}")
                 douyin_logger.success(
                     _msg("🥳", f"图文发布成功，已跳转到：{page.url}")
                 )
                 break
-            except Exception:
+            except Exception as _exc:
+                if "抖音平台提示" in str(_exc):
+                    raise
                 douyin_logger.info(
                     _msg("🏃", f"小人正在冲刺发布图文（{publish_try + 1}/{_PUBLISH_CLICK_MAX}）")
                 )
                 await asyncio.sleep(0.5)
         else:
+            tip = await _douyin_read_platform_toast(page)
+            if tip:
+                raise RuntimeError(_format_douyin_platform_tip(tip))
             raise RuntimeError(
                 f"图文发布超时：点击发布 {_PUBLISH_CLICK_MAX} 次仍未离开发布页"
             )
