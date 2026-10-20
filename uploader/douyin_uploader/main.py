@@ -82,6 +82,22 @@ def _cookies_have_douyin_session(cookies: list) -> bool:
     return any(c.get("name") in DOUYIN_SESSION_COOKIE_NAMES and c.get("value") for c in cookies)
 
 
+async def _commit_douyin_storage_state(context, account_file) -> bool:
+    """先写入临时文件，确认含登录 session 后再替换正式 Cookie。"""
+    dest = Path(account_file)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    incoming = dest.with_name(dest.name + ".incoming")
+    await context.storage_state(path=str(incoming))
+    cookies = await context.cookies()
+    ok = _cookies_have_douyin_session(cookies) or _storage_state_has_douyin_session(str(incoming))
+    if not ok:
+        incoming.unlink(missing_ok=True)
+        douyin_logger.warning(_msg("⚠️", f"新 Cookie 无有效 session，保留原文件: {dest}"))
+        return False
+    os.replace(incoming, dest)
+    return True
+
+
 def _is_douyin_login_landing_url(url: str) -> bool:
     """是否仍停留在扫码登录落地页（仅此类页面才应刷新二维码）"""
     if "creator.douyin.com/creator-micro" in url:
@@ -367,6 +383,50 @@ async def _douyin_upload_page_ready(page: Page) -> bool:
     if await _douyin_page_has_login_prompt(page):
         return False
     return await _douyin_upload_button_visible(page) or await _douyin_upload_input_visible(page)
+
+
+_CREATOR_TOUR_HINTS = (
+    "欢迎体验新版首页",
+    "新增智能创作",
+    "智能创作能力",
+)
+
+
+async def _dismiss_douyin_creator_tour(page: Page) -> bool:
+    """关掉创作者中心首页新手引导。引导会盖住首页，登录后跳上传页前先点「跳过」。"""
+    clicked_any = False
+    for _ in range(4):
+        try:
+            body = await page.locator("body").inner_text(timeout=1500)
+        except Exception:
+            return clicked_any
+        if not any(hint in (body or "") for hint in _CREATOR_TOUR_HINTS):
+            return clicked_any
+        clicked = False
+        for label in ("跳过", "我知道了", "知道了"):
+            loc = page.get_by_text(label, exact=True)
+            try:
+                count = min(await loc.count(), 4)
+            except Exception:
+                continue
+            for idx in range(count):
+                btn = loc.nth(idx)
+                try:
+                    if not await btn.is_visible():
+                        continue
+                    await btn.click(timeout=1500)
+                    clicked = True
+                    clicked_any = True
+                    douyin_logger.info(_msg("🪟", f"已关闭创作者中心引导: {label}"))
+                    await asyncio.sleep(0.4)
+                    break
+                except Exception:
+                    continue
+            if clicked:
+                break
+        if not clicked:
+            return clicked_any
+    return clicked_any
 
 
 # 抖音新版发布页 URL：离开该页面即视为发布成功（抖音改版后不一定跳到 content/manage，可能跳数据中心/首页）
@@ -797,6 +857,7 @@ async def cookie_auth(account_file):
                 context = await set_init_script(context)
                 page = await context.new_page()
                 await page.goto("https://creator.douyin.com/creator-micro/content/upload", wait_until="domcontentloaded", timeout=180000)
+                await _dismiss_douyin_creator_tour(page)
                 try:
                     await page.wait_for_load_state("networkidle", timeout=8000)
                 except Exception:
@@ -1041,53 +1102,25 @@ async def douyin_cookie_gen(
                 original_url=original_url,
             )
             if result["success"]:
-                await asyncio.sleep(2)
-                # 登录后先进入上传页再保存，确保 cookie + localStorage 对发布页有效
-                upload_ready = False
-                try:
-                    await page.goto(
-                        "https://creator.douyin.com/creator-micro/content/upload",
-                        wait_until="domcontentloaded",
-                        timeout=180000,
+                await asyncio.sleep(1)
+                saved = await _commit_douyin_storage_state(context, account_file)
+                cookies = await context.cookies()
+                if saved:
+                    douyin_logger.info(
+                        _msg(
+                            "💾",
+                            f"Cookie 已保存: {account_file}（cookies={len(cookies)}），关闭浏览器",
+                        )
                     )
-                    for wait_idx in range(30):
-                        if await _douyin_upload_page_ready(page):
-                            upload_ready = True
-                            douyin_logger.info(_msg("✅", f"登录后上传页就绪（{wait_idx + 1}s）"))
-                            break
-                        if await _douyin_page_has_login_prompt(page):
-                            break
-                        await asyncio.sleep(2)
-                except Exception as exc:
-                    douyin_logger.warning(_msg("⚠️", f"登录后跳转上传页异常: {exc}"))
-
-                if not upload_ready:
+                else:
                     result = _build_login_result(
                         False,
-                        "upload_not_ready",
-                        "扫码后未能进入上传页，请重试",
+                        "cookie_invalid",
+                        "抖音扫码流程结束，但未获取到有效 session",
                         account_file,
                         qrcode_info,
                         page.url,
                     )
-                else:
-                    await context.storage_state(path=account_file)
-                    douyin_logger.info(
-                        _msg(
-                            "💾",
-                            f"Cookie 已保存: {account_file}（cookies={len((await context.cookies()))}）",
-                        )
-                    )
-                    cookies = await context.cookies()
-                    if not _cookies_have_douyin_session(cookies) and not _storage_state_has_douyin_session(account_file):
-                        result = _build_login_result(
-                            False,
-                            "cookie_invalid",
-                            "抖音扫码流程结束，但未获取到有效 session",
-                            account_file,
-                            qrcode_info,
-                            page.url,
-                        )
         except Exception as exc:
             result = _build_login_result(False, "failed", str(exc), account_file, current_url=page.url if "page" in locals() else "")
         finally:
@@ -1597,7 +1630,9 @@ class DouYinBaseUploader(BaseVideoUploader):
             opened = True
             douyin_logger.info(_msg("⭐", "已勾选/点击「星图任务」"))
 
-        await asyncio.sleep(1.0)
+        # 先等任务列表加载，再往搜索框输入任务 ID 过滤
+        douyin_logger.info(_msg("⭐", "星图任务窗口已打开，等待列表加载 2s"))
+        await asyncio.sleep(2.0)
 
         # 弹层/下拉内的搜索框（可能挂在 body portal）
         input_box = None
@@ -1668,31 +1703,36 @@ class DouYinBaseUploader(BaseVideoUploader):
                 "发布页能看到「请选择星图任务」或「星图任务」开关，并尽量用星图任务ID发布"
             )
 
-        # 整段填入并主动触发 input，避免 Semi 搜索框不联想
+        # 清空后按任务 ID 逐字输入，触发列表过滤（不要只改 value）
         await input_box.click(force=True)
         try:
-            await input_box.evaluate(
-                """(el, v) => {
-                  const setter = Object.getOwnPropertyDescriptor(
-                    window.HTMLInputElement.prototype, 'value'
-                  ).set;
-                  setter.call(el, v);
-                  el.dispatchEvent(new Event('input', { bubbles: true }));
-                  el.dispatchEvent(new Event('change', { bubbles: true }));
-                  el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'Enter' }));
-                }""",
-                query,
-            )
+            await input_box.fill("", timeout=3000)
         except Exception:
+            try:
+                await input_box.press("Control+A")
+                await input_box.press("Backspace")
+            except Exception:
+                pass
+        typed = False
+        try:
+            await input_box.press_sequentially(query, delay=40)
+            typed = True
+        except Exception:
+            try:
+                await page.keyboard.type(query, delay=40)
+                typed = True
+            except Exception:
+                typed = False
+        if not typed:
             try:
                 await input_box.fill(query, timeout=8000)
             except Exception:
                 await page.keyboard.insert_text(query)
-        douyin_logger.info(_msg("⭐", f"已填入星图搜索词（{len(query)} 字符）"))
-        # 等搜索结果渲染：命中后立刻勾选；未命中也不久等（卡片轮询会兜底）
+        douyin_logger.info(_msg("⭐", f"已按任务ID过滤（{len(query)} 字符）"))
+        # 等过滤结果刷新后再勾选
         await asyncio.sleep(0.35)
         search_hit = False
-        for _ in range(6):
+        for _ in range(8):
             hit = await page.evaluate(
                 """(qid) => {
                   const t = document.body ? document.body.innerText : '';
@@ -1703,7 +1743,7 @@ class DouYinBaseUploader(BaseVideoUploader):
             if hit:
                 search_hit = True
                 break
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.15)
         douyin_logger.info(
             _msg("⭐", f"星图搜索词检测完成 hit={search_hit}")
         )
@@ -1729,14 +1769,16 @@ class DouYinBaseUploader(BaseVideoUploader):
                     f"星图 radio 未真正选中（ID={query}），已中止以免空点确定"
                 )
 
-        await asyncio.sleep(0.15)
         confirmed = await self._confirm_xingtu_selection(page)
         if not confirmed:
             await self._dump_xingtu_debug(page, query)
             await self._dismiss_xingtu_overlays(page)
             raise TimeoutError("已勾选星图任务，但未找到可用的「确定」按钮（semi-modal-footer）")
         douyin_logger.info(_msg("🥳", "已点击星图弹窗「确定」"))
-        await asyncio.sleep(0.35)
+        for _ in range(6):
+            if not await self._xingtu_still_unmounted(page):
+                break
+            await asyncio.sleep(0.15)
 
         # 硬校验：入口不能还是「请选择星图任务」
         if await self._xingtu_still_unmounted(page):
@@ -1865,24 +1907,40 @@ class DouYinBaseUploader(BaseVideoUploader):
         if n <= 0:
             return False
 
-        # 优先正文含 ID 的卡；否则首张（搜索结果通常只剩目标任务）
+        # 按任务 ID 过滤后选择：正文含完整 ID 或尾号；过滤后只剩一张时选该张
         card = cards.filter(has_text=query).first
-        if not await card.count():
+        matched = await card.count() > 0
+        if not matched:
             card = cards.filter(has_text=tail).first
-        if not await card.count():
+            matched = await card.count() > 0
+        if not matched and n == 1:
             card = cards.first
+            matched = True
+            douyin_logger.info(_msg("⭐", "[方案A-radio] 过滤后仅 1 张卡片，按搜索结果选择"))
+        if not matched:
+            douyin_logger.warning(
+                _msg("⚠️", f"[方案A-radio] 过滤后 {n} 张卡片均不含任务ID {tail}，不盲选")
+            )
+            return False
 
         via = await self._click_xingtu_card_radio(page, modal, card)
         if via and await self._modal_radio_really_checked(modal):
             douyin_logger.info(_msg("🥳", f"[方案A-radio] 弹窗内真实选中（via={via}）"))
             return True
 
-        # 再扫一遍弹窗内每张卡
-        for i in range(n):
-            via = await self._click_xingtu_card_radio(page, modal, cards.nth(i))
+        # 只在含任务 ID 的卡片上再点一次，避免选到列表里的其它任务
+        matched_cards = cards.filter(has_text=query)
+        if not await matched_cards.count():
+            matched_cards = cards.filter(has_text=tail)
+        retry_n = await matched_cards.count()
+        if retry_n <= 0 and n == 1:
+            matched_cards = cards
+            retry_n = 1
+        for i in range(retry_n):
+            via = await self._click_xingtu_card_radio(page, modal, matched_cards.nth(i))
             if via and await self._modal_radio_really_checked(modal):
                 douyin_logger.info(
-                    _msg("🥳", f"[方案A-radio] 弹窗内真实选中（第{i + 1}张, via={via}）")
+                    _msg("🥳", f"[方案A-radio] 弹窗内真实选中（匹配第{i + 1}张, via={via}）")
                 )
                 return True
 
@@ -2047,8 +2105,8 @@ class DouYinBaseUploader(BaseVideoUploader):
             if "semi-button-disabled" in cls:
                 douyin_logger.warning(_msg("⚠️", "星图「确定」按钮禁用"))
                 return False
-            await btn.click(timeout=5000)
-            await page.wait_for_timeout(280)
+            await btn.click(timeout=3000)
+            await page.wait_for_timeout(120)
             return True
         except Exception as exc:
             douyin_logger.warning(_msg("⚠️", f"点击星图确定失败: {exc}"))
@@ -3627,7 +3685,7 @@ class DouYinVideo(DouYinBaseUploader):
                     publish_clicked = True  # ★ 状态机翻转：此后的跳离才算发布成功
                     douyin_logger.info(_msg("👆", f"已点击发布按钮（第{publish_try+1}次），点击前URL: {url_before}"))
                     # 点击后先扫 toast：日限额等；无论是否已跳离页面，平台拦截提示一律失败
-                    await asyncio.sleep(1.2)
+                    await asyncio.sleep(0.4)
                     tip = await _douyin_read_platform_toast(page)
                     if tip:
                         raise RuntimeError(_format_douyin_platform_tip(tip))
@@ -3642,13 +3700,14 @@ class DouYinVideo(DouYinBaseUploader):
                 #       可能跳数据中心/创作者首页，只要 URL 不是发布页即算成功）
                 #   且页面无「投稿次数超限」等平台拦截 toast（toast 优先于 URL 跳转）
                 if publish_clicked:
-                    for _wait in range(4):  # 点后最多等 3*4=12s 确认跳转
+                    # 0.5s 轮询，最多约 20s；跳转后立刻结束，不再固定睡满 3s
+                    for _wait in range(40):
                         tip = await _douyin_read_platform_toast(page)
                         if tip:
                             raise RuntimeError(_format_douyin_platform_tip(tip))
                         if _douyin_left_publish_page(page):
                             break
-                        await asyncio.sleep(3)
+                        await asyncio.sleep(0.5)
                     tip = await _douyin_read_platform_toast(page)
                     if tip:
                         raise RuntimeError(_format_douyin_platform_tip(tip))
@@ -3659,8 +3718,8 @@ class DouYinVideo(DouYinBaseUploader):
                     )
                     break
                 else:
-                    # 没点到发布就不进入等待跳转，继续重试（避免没必要地 sleep 12s）
-                    await asyncio.sleep(1)
+                    # 没点到发布就不进入等待跳转，继续重试
+                    await asyncio.sleep(0.5)
             except Exception as _exc:
                 err = str(_exc)
                 # 平台原文提示 / 未点发布就跳离：直接抛出，勿空转重试
@@ -3688,9 +3747,8 @@ class DouYinVideo(DouYinBaseUploader):
                 "（可能已达日限/弹窗拦截，请勿继续空转）"
             )
 
-        await context.storage_state(path=self.account_file)
-        douyin_logger.success(_msg("🥳", "cookie 更新完毕"))
-        await asyncio.sleep(2)
+        if await _commit_douyin_storage_state(context, self.account_file):
+            douyin_logger.success(_msg("🥳", "cookie 更新完毕"))
         await context.close()
         await browser.close()
 
@@ -3854,10 +3912,8 @@ class DouYinNote(DouYinBaseUploader):
             await self.upload_note_content(page)
             upload_success = True
         finally:
-            if upload_success:
-                await context.storage_state(path=self.account_file)
+            if upload_success and await _commit_douyin_storage_state(context, self.account_file):
                 douyin_logger.success(_msg("🥳", "cookie 更新完毕"))
-                await asyncio.sleep(2)
             await context.close()
             await browser.close()
 
